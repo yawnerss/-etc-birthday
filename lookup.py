@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import os
 import re
+import sys
 import threading
 import time
+import traceback
 import unicodedata
 import urllib.request
 from datetime import datetime, date
@@ -16,15 +18,27 @@ GITHUB_RAW = os.environ.get("XLSX_URL", "").strip()
 
 def resolve_xlsx_path():
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.environ.get("XLSX_PATH"),
-        "/tmp/ofes_data.xlsx",
-        os.path.join(here, "ofes_data.xlsx"),
-        os.path.join(os.getcwd(), "ofes_data.xlsx"),
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
+
+    env_path = (os.environ.get("XLSX_PATH") or "").strip()
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    if GITHUB_RAW:
+        tmp = "/tmp/ofes_data.xlsx"
+        if os.path.exists(tmp):
+            return tmp
+    else:
+        try:
+            if os.path.exists("/tmp/ofes_data.xlsx"):
+                os.remove("/tmp/ofes_data.xlsx")
+        except OSError:
+            pass
+
+    for p in (os.path.join(here, "ofes_data.xlsx"),
+              os.path.join(os.getcwd(), "ofes_data.xlsx")):
+        if os.path.exists(p):
+            return p
+
     return os.path.join(here, "ofes_data.xlsx")
 
 
@@ -35,7 +49,8 @@ FUZZY_MIN = 0.72
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 _load_lock = threading.Lock()
-_INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}, "by_sorted": {}}
+_INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {}, "by_prefix": {},
+          "by_sorted": {}, "sheet": SHEET_NAME}
 
 _BDAY_FORMATS = [
     "%B %d, %Y", "%b %d, %Y",
@@ -68,7 +83,7 @@ def fetch_from_github():
             f.write(r.read())
         return tmp
     except Exception as e:
-        print(f"github fetch failed: {e}")
+        print(f"[startup] github fetch failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return None
 
 
@@ -217,13 +232,16 @@ def _cell_to_str(v):
 def _load_index():
     if not os.path.exists(XLSX_PATH):
         raise FileNotFoundError(f"missing workbook: {XLSX_PATH}")
+
     wb = load_workbook(XLSX_PATH, read_only=True, data_only=True)
     try:
-        ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb[wb.sheetnames[0]]
+        sheet = SHEET_NAME if SHEET_NAME in wb.sheetnames else wb.sheetnames[0]
+        ws = wb[sheet]
         it = ws.iter_rows(values_only=True)
         header_row = next(it, None)
         if header_row is None:
-            return {"rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}, "by_sorted": {}}
+            return {"rows": [], "by_id": {}, "by_token": {}, "by_prefix": {},
+                    "by_sorted": {}, "sheet": sheet}
 
         headers = {}
         for idx, name in enumerate(header_row):
@@ -240,6 +258,11 @@ def _load_index():
         id_i = col("Student ID", "StudentID", "ID")
         name_i = col("Name")
         bd_i = col("Birthday")
+
+        if name_i is None:
+            raise ValueError(
+                f"header 'Name' not found. Got headers: {list(headers.keys())}"
+            )
 
         rows, by_id, by_token, by_prefix = [], {}, {}, {}
         for r_idx, row in enumerate(it, start=2):
@@ -283,7 +306,7 @@ def _load_index():
             by_sorted.setdefault(key, []).append(i)
 
         return {"rows": rows, "by_id": by_id, "by_token": by_token,
-                "by_prefix": by_prefix, "by_sorted": by_sorted}
+                "by_prefix": by_prefix, "by_sorted": by_sorted, "sheet": sheet}
     finally:
         wb.close()
 
@@ -372,7 +395,6 @@ def full_student(idx, i):
         "Month": m_name,
         "Day": row["birthday_day"] if row["birthday_day"] is not None else "",
         "_row": row["row"],
-        "_bday_parsed": bool(row["birthday_month"]),
     }
 
 
@@ -399,6 +421,19 @@ def resolve_month(raw):
     return None, None
 
 
+def _err(where, e, t0):
+    print(f"[{where}] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+    return jsonify({
+        "error": f"{type(e).__name__}: {e}",
+        "where": where,
+        "xlsx_path": XLSX_PATH,
+        "exists": os.path.exists(XLSX_PATH),
+        "elapsedMs": int((time.time() - t0) * 1000),
+    }), 500
+
+
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -411,8 +446,10 @@ html[data-theme="dark"]{--bg:#0b0d10;--panel:#121519;--bd:#22272e;--fg:#e6edf3;-
 *{box-sizing:border-box;}
 html,body{margin:0;background:var(--bg);color:var(--fg);}
 body{font:14px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased;}
-header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:var(--bg);z-index:10;}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:var(--bg);z-index:10;gap:12px;}
 header h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.01em;}
+.hbtns{display:flex;align-items:center;gap:8px;}
+#serverStatus{font-size:11px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
 .toggle{border:1px solid var(--bd);border-radius:8px;background:var(--panel);color:var(--fg);padding:6px 10px;font:inherit;font-size:13px;cursor:pointer;display:inline-flex;gap:6px;align-items:center;}
 .toggle:hover{border-color:var(--muted);}
 main{max-width:1200px;margin:0 auto;padding:20px;}
@@ -429,7 +466,7 @@ button{padding:8px 14px;border:1px solid var(--bd);border-radius:8px;background:
 button.primary{background:var(--ac);border-color:var(--ac);color:var(--ac-fg);}
 button:hover{filter:brightness(1.04);}
 button:disabled{opacity:.5;cursor:not-allowed;}
-#status{min-height:18px;font-size:13px;color:var(--muted);margin-bottom:10px;}
+#status{min-height:18px;font-size:13px;color:var(--muted);margin-bottom:10px;white-space:pre-wrap;word-break:break-word;}
 #status.ok{color:var(--ok);}
 #status.bad{color:var(--bad);}
 .spinner{display:inline-block;width:10px;height:10px;border:2px solid var(--muted);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px;}
@@ -453,7 +490,10 @@ tr:last-child td{border-bottom:none;}
 <body>
 <header>
   <h1>Birthdays</h1>
-  <button class="toggle" id="theme"><span id="theme-ico">◐</span> <span id="theme-txt">Dark</span></button>
+  <div class="hbtns">
+    <span id="serverStatus">●</span>
+    <button class="toggle" id="theme"><span id="theme-ico">◐</span> <span id="theme-txt">Dark</span></button>
+  </div>
 </header>
 <main>
 <section>
@@ -499,6 +539,7 @@ const STATUS=document.getElementById('status');
 const OUT=document.getElementById('out');
 const PASTE=document.getElementById('paste');
 const SINGLE=document.getElementById('single');
+const SERVER_STATUS=document.getElementById('serverStatus');
 const MONTHS=["","January","February","March","April","May","June","July","August","September","October","November","December"];
 
 const BATCH_SIZE=400;
@@ -539,6 +580,29 @@ PASTE.addEventListener('input',()=>{
   clearTimeout(_t);
   _t=setTimeout(()=>localStorage.setItem(LS_PASTE,PASTE.value),400);
 });
+
+async function checkServerStatus(){
+  SERVER_STATUS.style.color='var(--muted)';
+  SERVER_STATUS.textContent='● checking';
+  try{
+    const r=await fetch('/healthz',{cache:'no-store'});
+    const j=await r.json();
+    if(j.ok){
+      SERVER_STATUS.style.color='var(--ok)';
+      SERVER_STATUS.textContent='● '+j.rows+' rows';
+      SERVER_STATUS.title=j.path||'';
+    }else{
+      SERVER_STATUS.style.color='var(--bad)';
+      SERVER_STATUS.textContent='● '+((j.error||'error').slice(0,60));
+      SERVER_STATUS.title=(j.error||'')+'\n'+(j.path||'');
+    }
+  }catch(e){
+    SERVER_STATUS.style.color='var(--bad)';
+    SERVER_STATUS.textContent='● offline';
+    SERVER_STATUS.title=String(e);
+  }
+}
+checkServerStatus();
 
 function setStatus(m,k){
   STATUS.innerHTML='';
@@ -611,7 +675,8 @@ function renderSingle(data){
   const s=el('div');s.className='summary';
   s.innerHTML='<span>matched <b>'+data.matchType+'</b> · score <b>'+data.score+'</b></span>'+
     '<span>row <b>'+data.student._row+'</b></span>'+
-    '<span>query <b>'+data.query+'</b></span>';
+    '<span>query <b>'+data.query+'</b></span>'+
+    (data.elapsedMs!==undefined?'<span>'+data.elapsedMs+' ms</span>':'');
   OUT.appendChild(s);
 
   const card=el('div');card.className='card';
@@ -713,11 +778,26 @@ function renderListResult(agg){
   s.innerHTML='<span><b>'+agg.total+'</b> unique lines</span>'+
     (agg.duplicates&&agg.duplicates.length?'<span><b>'+agg.duplicates.length+'</b> duplicate(s) skipped</span>':'')+
     '<span><b>'+agg.matchedCount+'</b> matched</span>'+
-    '<span><b>'+agg.thisMonthCount+'</b> in <b>'+agg.monthName+'</b></span>'+
+    '<span><b>'+agg.thisMonthCount+'</b> in <b>'+(agg.monthName||'—')+'</b></span>'+
     (agg.unmatchedCount?'<span><b>'+agg.unmatchedCount+'</b> unmatched</span>':'')+
     (agg.failedBatches?'<span class="bad"><b>'+agg.failedBatches+'</b> batch(es) failed</span>':'')+
     (agg.elapsedMs!==undefined?'<span>'+agg.elapsedMs+' ms</span>':'');
   OUT.appendChild(s);
+
+  if(agg.lastError){
+    const e=el('div');e.className='card';
+    e.style.borderColor='var(--bad)';
+    const kv=el('div');kv.className='kv';
+    kv.appendChild(el('div','Server error')).className='k';
+    kv.appendChild(el('div',agg.lastError));
+    e.appendChild(kv);
+    OUT.appendChild(e);
+    OUT.appendChild(el('div')).style.height='12px';
+  }
+
+  if(!agg.matchedCount && !agg.unmatchedCount){
+    return;
+  }
 
   const bar=el('div');bar.className='row';bar.style.marginTop='0';
   const btn=el('button','Download CSV (all '+agg.total+' lines)');
@@ -726,7 +806,7 @@ function renderListResult(agg){
   OUT.appendChild(bar);
 
   const g1=el('div');g1.className='group';
-  g1.appendChild(el('h3','Birthday in '+agg.monthName+' ('+agg.thisMonth.length+')'));
+  g1.appendChild(el('h3','Birthday in '+(agg.monthName||'—')+' ('+agg.thisMonth.length+')'));
   g1.appendChild(renderTable(agg.thisMonth,['Student ID','Name','Birthday','This month','Match'],RENDER_CAP));
   OUT.appendChild(g1);
 
@@ -767,46 +847,63 @@ async function withTimeout(url,opts,ms){
   finally{clearTimeout(tm);}
 }
 
+async function readErr(r){
+  try{const j=await r.json();return j.error||('HTTP '+r.status);}
+  catch(_){return 'HTTP '+r.status;}
+}
+
 async function lookupSingle(){
   const q=SINGLE.value.trim();
   if(!q){setStatus('Enter a name or student ID.','bad');return;}
   setBusy(true);setStatus('Looking up…','load');
   try{
     const r=await withTimeout('/student?q='+encodeURIComponent(q),{},15000);
+    if(!r.ok){
+      const e=await readErr(r);
+      setStatus('Error: '+e,'bad');
+      return;
+    }
     const j=await r.json();
-    if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
     if(!j.found){setStatus('No match for "'+q+'".','bad');return;}
     setStatus('Matched '+j.student['Name']+' · '+j.matchType+' '+j.score+' · '+j.elapsedMs+' ms','ok');
     renderSingle(j);
   }catch(e){
     setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-  }finally{setBusy(false);}
+  }finally{setBusy(false);checkServerStatus();}
 }
 
 async function scanWorkbook(){
   setBusy(true);setStatus('Scanning month…','load');
   try{
     const r=await withTimeout('/birthdays?month='+monthSel(),{},15000);
+    if(!r.ok){
+      const e=await readErr(r);
+      setStatus('Error: '+e,'bad');
+      return;
+    }
     const j=await r.json();
-    if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
     setStatus(j.count+' birthday(s) in '+j.monthName+' · '+j.elapsedMs+' ms','ok');
     renderWorkbookResult(j);
   }catch(e){
     setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-  }finally{setBusy(false);}
+  }finally{setBusy(false);checkServerStatus();}
 }
 
 async function scanAll(){
   setBusy(true);setStatus('Scanning whole file…','load');
   try{
     const r=await withTimeout('/all',{},30000);
+    if(!r.ok){
+      const e=await readErr(r);
+      setStatus('Error: '+e,'bad');
+      return;
+    }
     const j=await r.json();
-    if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
     setStatus(j.count+' row(s) in '+j.sheet+' · '+j.elapsedMs+' ms','ok');
     renderAllResult(j);
   }catch(e){
     setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-  }finally{setBusy(false);}
+  }finally{setBusy(false);checkServerStatus();}
 }
 
 async function checkList(){
@@ -825,14 +922,18 @@ async function checkList(){
       fd.append('file',file);
       fd.append('month',String(month));
       const r=await withTimeout('/birthdays/list',{method:'POST',body:fd},120000);
+      if(!r.ok){
+        const e=await readErr(r);
+        setStatus('Error: '+e,'bad');
+        return;
+      }
       const j=await r.json();
-      if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
       j.elapsedMs=Math.round(performance.now()-t0);
       setStatus(j.thisMonthCount+' classmate(s) have birthday in '+j.monthName+' · '+j.elapsedMs+' ms','ok');
       renderListResult(j);
     }catch(e){
       setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-    }finally{setBusy(false);}
+    }finally{setBusy(false);checkServerStatus();}
     return;
   }
 
@@ -843,7 +944,7 @@ async function checkList(){
   const agg={
     monthName:null, total:0, rawTotal:0, duplicates:[],
     thisMonth:[], matchedOther:[], unmatched:[],
-    failedBatches:0, batches:batches.length, doneBatches:0
+    failedBatches:0, lastError:null
   };
 
   try{
@@ -855,18 +956,24 @@ async function checkList(){
           headers:{'Content-Type':'application/json'},
           body:JSON.stringify({text:batches[b].join('\n'),month})
         },60000);
-        if(!r.ok){agg.failedBatches++;continue;}
-        const j=await r.json();
+        if(!r.ok){
+          agg.failedBatches++;
+          if(!agg.lastError) agg.lastError=await readErr(r);
+          continue;
+        }
+        let j;
+        try{ j=await r.json(); }
+        catch(err){ agg.failedBatches++; if(!agg.lastError) agg.lastError='bad JSON from server (HTTP '+r.status+')'; continue; }
         agg.monthName=j.monthName;
-        agg.rawTotal+=j.rawTotal;
-        agg.total+=j.total;
+        agg.rawTotal+=j.rawTotal||0;
+        agg.total+=j.total||0;
         agg.duplicates.push(...(j.duplicates||[]));
         agg.thisMonth.push(...(j.thisMonth||[]));
         agg.matchedOther.push(...(j.matchedOther||[]));
         agg.unmatched.push(...(j.unmatched||[]));
-        agg.doneBatches=b+1;
       }catch(e){
         agg.failedBatches++;
+        if(!agg.lastError) agg.lastError=String(e.message||e);
       }
     }
 
@@ -877,11 +984,11 @@ async function checkList(){
     agg.unmatchedCount=agg.unmatched.length;
     agg.elapsedMs=Math.round(performance.now()-t0);
 
-    const tag=agg.failedBatches?(' · '+agg.failedBatches+' batch(es) failed'):'';
-    setStatus(agg.thisMonthCount+' classmate(s) have birthday in '+agg.monthName+' · '+agg.total+' lines · '+agg.elapsedMs+' ms'+tag,agg.failedBatches?'bad':'ok');
+    const tag=agg.failedBatches?(' · '+agg.failedBatches+' batch(es) failed: '+(agg.lastError||'')):'';
+    setStatus(agg.thisMonthCount+' classmate(s) have birthday in '+(agg.monthName||'—')+' · '+agg.total+' lines · '+agg.elapsedMs+' ms'+tag,agg.failedBatches?'bad':'ok');
     renderListResult(agg);
   }finally{
-    setBusy(false);
+    setBusy(false);checkServerStatus();
   }
 }
 
@@ -906,53 +1013,99 @@ def index():
     return INDEX_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
+@app.get("/debug/status")
+def debug_status():
+    out = {
+        "xlsx_path": XLSX_PATH,
+        "exists": os.path.exists(XLSX_PATH),
+        "github_url": GITHUB_RAW or None,
+        "sheet_name_setting": SHEET_NAME,
+        "cwd": os.getcwd(),
+        "script_dir": os.path.dirname(os.path.abspath(__file__)),
+    }
+    if out["exists"]:
+        try:
+            st = os.stat(XLSX_PATH)
+            out["size"] = st.st_size
+            out["mtime"] = datetime.fromtimestamp(st.st_mtime).isoformat()
+            with open(XLSX_PATH, "rb") as f:
+                head = f.read(16)
+            out["first_bytes_hex"] = head.hex()
+            out["looks_like_xlsx"] = head[:2] == b"PK"
+        except OSError as e:
+            out["stat_error"] = f"{type(e).__name__}: {e}"
+        try:
+            wb = load_workbook(XLSX_PATH, read_only=True, data_only=True)
+            try:
+                out["sheets"] = wb.sheetnames
+                sname = SHEET_NAME if SHEET_NAME in wb.sheetnames else wb.sheetnames[0]
+                out["active_sheet"] = sname
+                ws = wb[sname]
+                it = ws.iter_rows(values_only=True)
+                header = next(it, None)
+                out["headers"] = [str(h) if h is not None else None for h in (header or [])]
+                cnt = 0
+                for _ in it:
+                    cnt += 1
+                out["data_rows"] = cnt
+            finally:
+                wb.close()
+        except Exception as e:
+            out["load_error"] = f"{type(e).__name__}: {e}"
+    try:
+        idx = get_index()
+        out["index_rows"] = len(idx["rows"])
+        out["index_sheet"] = idx.get("sheet", SHEET_NAME)
+    except Exception as e:
+        out["index_error"] = f"{type(e).__name__}: {e}"
+    return jsonify(out), 200
+
+
 @app.get("/student")
 def student_single():
     t0 = time.time()
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return jsonify({"error": "q required"}), 400
     try:
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return jsonify({"error": "q required"}), 400
         idx = get_index()
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 500
-
-    match = match_index(idx, q)
-    if match is None:
+        match = match_index(idx, q)
+        if match is None:
+            return jsonify({"found": False, "query": q,
+                            "elapsedMs": int((time.time() - t0) * 1000)}), 404
         return jsonify({
-            "found": False, "query": q,
+            "found": True, "query": q,
+            "matchType": match["matchType"],
+            "score": round(match["score"], 3),
+            "student": full_student(idx, match["index"]),
             "elapsedMs": int((time.time() - t0) * 1000),
-        }), 404
-
-    return jsonify({
-        "found": True,
-        "query": q,
-        "matchType": match["matchType"],
-        "score": round(match["score"], 3),
-        "student": full_student(idx, match["index"]),
-        "elapsedMs": int((time.time() - t0) * 1000),
-    }), 200
+        }), 200
+    except FileNotFoundError as e:
+        return _err("/student", e, t0)
+    except Exception as e:
+        return _err("/student", e, t0)
 
 
 @app.get("/birthdays")
 def birthdays():
     t0 = time.time()
-    m_num, m_name = resolve_month(request.args.get("month"))
-    if m_num is None:
-        return jsonify({"error": "month must be 1-12 or month name"}), 400
     try:
+        m_num, m_name = resolve_month(request.args.get("month"))
+        if m_num is None:
+            return jsonify({"error": "month must be 1-12 or month name"}), 400
         idx = get_index()
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 500
-    out = []
-    for row in idx["rows"]:
-        if row["birthday_month"] != m_num:
-            continue
-        out.append({"Student ID": row["id"], "Name": row["name"], "Birthday": row["birthday"],
-                    "_row": row["row"], "day": row["birthday_day"]})
-    out.sort(key=lambda x: (x["day"] or 99, x.get("Name", "")))
-    return jsonify({"month": m_num, "monthName": m_name, "count": len(out), "rows": out,
-                    "elapsedMs": int((time.time() - t0) * 1000)}), 200
+        out = []
+        for row in idx["rows"]:
+            if row["birthday_month"] != m_num:
+                continue
+            out.append({"Student ID": row["id"], "Name": row["name"],
+                        "Birthday": row["birthday"], "_row": row["row"],
+                        "day": row["birthday_day"]})
+        out.sort(key=lambda x: (x["day"] or 99, x.get("Name", "")))
+        return jsonify({"month": m_num, "monthName": m_name, "count": len(out),
+                        "rows": out, "elapsedMs": int((time.time() - t0) * 1000)}), 200
+    except Exception as e:
+        return _err("/birthdays", e, t0)
 
 
 @app.get("/all")
@@ -960,177 +1113,156 @@ def all_rows():
     t0 = time.time()
     try:
         idx = get_index()
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 500
-
-    out = []
-    for row in idx["rows"]:
-        out.append({
-            "Student ID": row["id"],
-            "Name": row["name"],
-            "Birthday": row["birthday"],
-            "Month": _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else "",
-            "Day": row["birthday_day"] if row["birthday_day"] is not None else "",
-            "_row": row["row"],
-        })
-
-    q = (request.args.get("q") or "").strip().lower()
-    if q:
-        out = [r for r in out if (
-            q in str(r["Student ID"]).lower()
-            or q in str(r["Name"]).lower()
-            or q in str(r["Birthday"]).lower()
-            or q in str(r["Month"]).lower()
-        )]
-
-    m_raw = request.args.get("month")
-    if m_raw:
-        m_num, m_name = resolve_month(m_raw)
-        if m_num is None:
-            return jsonify({"error": "month must be 1-12 or month name"}), 400
-        out = [r for r in out if r["Month"] == m_name]
-
-    sheet = SHEET_NAME
-    try:
-        wb = load_workbook(XLSX_PATH, read_only=True)
-        try:
-            sheet = SHEET_NAME if SHEET_NAME in wb.sheetnames else wb.sheetnames[0]
-        finally:
-            wb.close()
-    except Exception:
-        pass
-
-    return jsonify({
-        "sheet": sheet,
-        "count": len(out),
-        "rows": out,
-        "elapsedMs": int((time.time() - t0) * 1000),
-    }), 200
+        out = []
+        for row in idx["rows"]:
+            out.append({
+                "Student ID": row["id"], "Name": row["name"],
+                "Birthday": row["birthday"],
+                "Month": _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else "",
+                "Day": row["birthday_day"] if row["birthday_day"] is not None else "",
+                "_row": row["row"],
+            })
+        q = (request.args.get("q") or "").strip().lower()
+        if q:
+            out = [r for r in out if (
+                q in str(r["Student ID"]).lower()
+                or q in str(r["Name"]).lower()
+                or q in str(r["Birthday"]).lower()
+                or q in str(r["Month"]).lower()
+            )]
+        m_raw = request.args.get("month")
+        if m_raw:
+            m_num, m_name = resolve_month(m_raw)
+            if m_num is None:
+                return jsonify({"error": "month must be 1-12 or month name"}), 400
+            out = [r for r in out if r["Month"] == m_name]
+        return jsonify({"sheet": idx.get("sheet", SHEET_NAME), "count": len(out),
+                        "rows": out, "elapsedMs": int((time.time() - t0) * 1000)}), 200
+    except Exception as e:
+        return _err("/all", e, t0)
 
 
 @app.post("/birthdays/list")
 def birthdays_list():
     t0 = time.time()
-    payload = request.get_json(silent=True)
-    if payload is not None:
-        text = payload.get("text", "")
-        raw_month = payload.get("month")
-    elif "file" in request.files:
-        f = request.files["file"]
-        text = f.read().decode("utf-8", errors="replace")
-        raw_month = request.form.get("month")
-    else:
-        text = request.form.get("text", "")
-        raw_month = request.form.get("month")
-
-    raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    if not raw_lines:
-        return jsonify({"error": "no lines provided"}), 400
-
-    m_num, m_name = resolve_month(raw_month)
-    if m_num is None:
-        return jsonify({"error": "month must be 1-12 or month name"}), 400
-
-    seen, lines, duplicates = set(), [], []
-    for ln in raw_lines:
-        k = re.sub(r"\s+", " ", _fold(ln)).strip()
-        if k in seen:
-            duplicates.append(ln)
-            continue
-        seen.add(k)
-        lines.append(ln)
-
     try:
+        payload = request.get_json(silent=True)
+        if payload is not None:
+            text = payload.get("text", "")
+            raw_month = payload.get("month")
+        elif "file" in request.files:
+            f = request.files["file"]
+            text = f.read().decode("utf-8", errors="replace")
+            raw_month = request.form.get("month")
+        else:
+            text = request.form.get("text", "")
+            raw_month = request.form.get("month")
+
+        raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if not raw_lines:
+            return jsonify({"error": "no lines provided"}), 400
+
+        m_num, m_name = resolve_month(raw_month)
+        if m_num is None:
+            return jsonify({"error": "month must be 1-12 or month name"}), 400
+
+        seen, lines, duplicates = set(), [], []
+        for ln in raw_lines:
+            k = re.sub(r"\s+", " ", _fold(ln)).strip()
+            if k in seen:
+                duplicates.append(ln)
+                continue
+            seen.add(k)
+            lines.append(ln)
+
         idx = get_index()
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 500
 
-    this_month, matched_other, unmatched = [], [], []
+        this_month, matched_other, unmatched = [], [], []
 
-    for line in lines:
-        inline_bd, matched_str = find_date_in_line(line)
-        name_part = line.replace(matched_str, "").strip(" ,;-") if matched_str else line
+        for line in lines:
+            inline_bd, matched_str = find_date_in_line(line)
+            name_part = line.replace(matched_str, "").strip(" ,;-") if matched_str else line
 
-        match = match_index(idx, line)
-        if match is None and name_part and name_part != line:
-            match = match_index(idx, name_part)
+            match = match_index(idx, line)
+            if match is None and name_part and name_part != line:
+                match = match_index(idx, name_part)
 
-        entry = {"line": line}
+            entry = {"line": line}
 
-        if match is not None:
-            student = student_from_index(idx, match["index"])
-            bd = parse_birthday(student["Birthday"]) or inline_bd
-            entry.update({
-                "matched": True,
-                "rowNumber": idx["rows"][match["index"]]["row"],
-                "score": round(match["score"], 3),
-                "matchType": match["matchType"],
-                "student": student,
-            })
-            if bd is not None:
-                entry["birthdayMonth"] = bd.month
-                entry["birthdayMonthName"] = _MONTH_NAMES[bd.month]
-                entry["birthdayDay"] = bd.day
-                entry["thisMonth"] = (bd.month == m_num)
+            if match is not None:
+                student = student_from_index(idx, match["index"])
+                bd = parse_birthday(student["Birthday"]) or inline_bd
+                entry.update({
+                    "matched": True,
+                    "rowNumber": idx["rows"][match["index"]]["row"],
+                    "score": round(match["score"], 3),
+                    "matchType": match["matchType"],
+                    "student": student,
+                })
+                if bd is not None:
+                    entry["birthdayMonth"] = bd.month
+                    entry["birthdayMonthName"] = _MONTH_NAMES[bd.month]
+                    entry["birthdayDay"] = bd.day
+                    entry["thisMonth"] = (bd.month == m_num)
+                else:
+                    entry["birthdayMonth"] = None
+                    entry["birthdayMonthName"] = None
+                    entry["birthdayDay"] = None
+                    entry["thisMonth"] = False
+            elif inline_bd is not None:
+                entry.update({
+                    "matched": False, "rowNumber": None, "score": None, "matchType": "inline",
+                    "student": {"Student ID": "", "Name": name_part or line,
+                                "Birthday": inline_bd.strftime("%B %d, %Y")},
+                    "birthdayMonth": inline_bd.month,
+                    "birthdayMonthName": _MONTH_NAMES[inline_bd.month],
+                    "birthdayDay": inline_bd.day,
+                    "thisMonth": inline_bd.month == m_num,
+                })
             else:
-                entry["birthdayMonth"] = None
-                entry["birthdayMonthName"] = None
-                entry["birthdayDay"] = None
-                entry["thisMonth"] = False
-        elif inline_bd is not None:
-            entry.update({
-                "matched": False, "rowNumber": None, "score": None, "matchType": "inline",
-                "student": {"Student ID": "", "Name": name_part or line,
-                            "Birthday": inline_bd.strftime("%B %d, %Y")},
-                "birthdayMonth": inline_bd.month,
-                "birthdayMonthName": _MONTH_NAMES[inline_bd.month],
-                "birthdayDay": inline_bd.day,
-                "thisMonth": inline_bd.month == m_num,
-            })
-        else:
-            entry.update({
-                "matched": False, "rowNumber": None, "score": None, "matchType": None,
-                "student": None, "birthdayMonth": None, "birthdayMonthName": None,
-                "birthdayDay": None, "thisMonth": False,
-                "error": "no match and no inline date",
-            })
+                entry.update({
+                    "matched": False, "rowNumber": None, "score": None, "matchType": None,
+                    "student": None, "birthdayMonth": None, "birthdayMonthName": None,
+                    "birthdayDay": None, "thisMonth": False,
+                    "error": "no match and no inline date",
+                })
 
-        if entry["thisMonth"]:
-            this_month.append(entry)
-        elif entry["student"] is not None:
-            matched_other.append(entry)
-        else:
-            unmatched.append(entry)
+            if entry["thisMonth"]:
+                this_month.append(entry)
+            elif entry["student"] is not None:
+                matched_other.append(entry)
+            else:
+                unmatched.append(entry)
 
-    this_month.sort(key=lambda e: (e.get("birthdayDay") or 99, (e.get("student") or {}).get("Name", "")))
-    matched_other.sort(key=lambda e: (e.get("birthdayMonth") or 99, e.get("birthdayDay") or 99))
+        this_month.sort(key=lambda e: (e.get("birthdayDay") or 99, (e.get("student") or {}).get("Name", "")))
+        matched_other.sort(key=lambda e: (e.get("birthdayMonth") or 99, e.get("birthdayDay") or 99))
 
-    return jsonify({
-        "month": m_num, "monthName": m_name,
-        "rawTotal": len(raw_lines), "total": len(lines), "duplicates": duplicates,
-        "matchedCount": len(this_month) + len(matched_other),
-        "thisMonthCount": len(this_month),
-        "unmatchedCount": len(unmatched),
-        "thisMonth": this_month, "matchedOther": matched_other, "unmatched": unmatched,
-        "elapsedMs": int((time.time() - t0) * 1000),
-    }), 200
+        return jsonify({
+            "month": m_num, "monthName": m_name,
+            "rawTotal": len(raw_lines), "total": len(lines), "duplicates": duplicates,
+            "matchedCount": len(this_month) + len(matched_other),
+            "thisMonthCount": len(this_month),
+            "unmatchedCount": len(unmatched),
+            "thisMonth": this_month, "matchedOther": matched_other, "unmatched": unmatched,
+            "elapsedMs": int((time.time() - t0) * 1000),
+        }), 200
+    except Exception as e:
+        return _err("/birthdays/list", e, t0)
 
 
 @app.get("/debug/match")
 def debug_match():
-    q = request.args.get("q", "").strip()
+    q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"error": "q required"}), 400
     try:
         idx = get_index()
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 500
-
+    except Exception as e:
+        return _err("/debug/match", e, time.time())
     forms = parse_line_forms(q)
     by_token = idx["by_token"]
     by_prefix = idx["by_prefix"]
     by_sorted = idx["by_sorted"]
-
     detail = []
     for form in forms:
         ftok = _tokens(form)
@@ -1147,22 +1279,16 @@ def debug_match():
                            "name": idx["rows"][i]["name"],
                            "score": round(sc, 3), "matchType": mt})
         scored.sort(key=lambda x: -x["score"])
-        detail.append({
-            "form": form,
-            "tokens": ftok,
-            "sorted_key_hit": bool(by_sorted.get(ftok_sorted)),
-            "top_candidates": scored[:5],
-        })
-
+        detail.append({"form": form, "tokens": ftok,
+                       "sorted_key_hit": bool(by_sorted.get(ftok_sorted)),
+                       "top_candidates": scored[:5]})
     win = match_index(idx, q)
     return jsonify({
-        "query": q,
-        "forms": detail,
+        "query": q, "forms": detail,
         "winner": None if not win else {
             "index": win["index"], "row": idx["rows"][win["index"]]["row"],
             "name": idx["rows"][win["index"]]["name"],
-            "score": win["score"], "matchType": win["matchType"],
-        },
+            "score": win["score"], "matchType": win["matchType"]},
         "index_size": len(idx["rows"]),
     }), 200
 
@@ -1176,9 +1302,14 @@ def health():
 def healthz():
     try:
         idx = get_index()
-        return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH}), 200
+        return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH,
+                        "sheet": idx.get("sheet", SHEET_NAME)}), 200
     except FileNotFoundError as e:
         return jsonify({"ok": False, "error": str(e), "path": XLSX_PATH}), 503
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"{type(e).__name__}: {e}",
+                        "path": XLSX_PATH}), 503
 
 
 @app.get("/refresh")
@@ -1193,24 +1324,34 @@ def refresh():
     with _load_lock:
         XLSX_PATH = tmp
         _INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {},
-                  "by_prefix": {}, "by_sorted": {}}
+                  "by_prefix": {}, "by_sorted": {}, "sheet": SHEET_NAME}
     try:
         idx = get_index()
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return _err("/refresh", e, time.time())
     return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH}), 200
 
 
+# Startup: fetch if configured, warm index, log clearly
 if GITHUB_RAW:
     _tmp = fetch_from_github()
     if _tmp:
         XLSX_PATH = _tmp
+        print(f"[startup] fetched workbook to {XLSX_PATH}", file=sys.stderr, flush=True)
 
 if os.path.exists(XLSX_PATH):
+    _st = os.stat(XLSX_PATH)
+    print(f"[startup] workbook {XLSX_PATH} ({_st.st_size} bytes)", file=sys.stderr, flush=True)
     try:
-        get_index()
-    except Exception:
-        pass
+        _idx = get_index()
+        print(f"[startup] indexed {len(_idx['rows'])} rows from sheet '{_idx.get('sheet','?')}'",
+              file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[startup] INDEX FAILED {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+else:
+    print(f"[startup] WORKBOOK NOT FOUND at {XLSX_PATH}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
