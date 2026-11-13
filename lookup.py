@@ -10,13 +10,28 @@ from difflib import SequenceMatcher
 from flask import Flask, jsonify, request
 from openpyxl import load_workbook
 
-XLSX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ofes_data.xlsx")
+
+def resolve_xlsx_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.environ.get("XLSX_PATH"),
+        os.path.join(here, "ofes_data.xlsx"),
+        os.path.join(os.getcwd(), "ofes_data.xlsx"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return os.path.join(here, "ofes_data.xlsx")
+
+
+XLSX_PATH = resolve_xlsx_path()
 SHEET_NAME = "Sheet1"
 FUZZY_MIN = 0.72
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 _load_lock = threading.Lock()
-_INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}}
+_INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}, "by_sorted": {}}
 
 _BDAY_FORMATS = [
     "%B %d, %Y", "%b %d, %Y",
@@ -33,7 +48,7 @@ _MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
 
 _MONTH_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
              r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
-             r"Nov(?:ember)?|Dec(?:ember)?)")
+             r"Nov(?:ember)?|Dec(?:ember)?")
 
 
 def _try_parse_date(s):
@@ -187,7 +202,7 @@ def _load_index():
         it = ws.iter_rows(values_only=True)
         header_row = next(it, None)
         if header_row is None:
-            return {"rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}}
+            return {"rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}, "by_sorted": {}}
 
         headers = {}
         for idx, name in enumerate(header_row):
@@ -239,7 +254,15 @@ def _load_index():
                 if len(t) >= 3:
                     by_prefix.setdefault(t[:3], set()).add(i)
 
-        return {"rows": rows, "by_id": by_id, "by_token": by_token, "by_prefix": by_prefix}
+        by_sorted = {}
+        for i, r in enumerate(rows):
+            if not r["name_tokens"]:
+                continue
+            key = tuple(sorted(r["name_tokens"]))
+            by_sorted.setdefault(key, []).append(i)
+
+        return {"rows": rows, "by_id": by_id, "by_token": by_token,
+                "by_prefix": by_prefix, "by_sorted": by_sorted}
     finally:
         wb.close()
 
@@ -273,12 +296,14 @@ def match_index(idx, line, min_score=FUZZY_MIN):
     by_id = idx["by_id"]
     by_token = idx["by_token"]
     by_prefix = idx["by_prefix"]
+    by_sorted = idx["by_sorted"]
     rows = idx["rows"]
 
     for form in forms:
         fk = re.sub(r"\s+", " ", _fold(form)).strip()
         if fk in by_id:
             return {"index": by_id[fk], "score": 1.0, "matchType": "id"}
+
     for form in forms:
         for tok in re.split(r"[,\s;]+", form):
             if not tok:
@@ -286,6 +311,14 @@ def match_index(idx, line, min_score=FUZZY_MIN):
             tk = re.sub(r"\s+", " ", _fold(tok)).strip()
             if tk in by_id:
                 return {"index": by_id[tk], "score": 1.0, "matchType": "id-token"}
+
+    for form in forms:
+        qtok = tuple(sorted(_tokens(form)))
+        if not qtok:
+            continue
+        hit = by_sorted.get(qtok)
+        if hit:
+            return {"index": hit[0], "score": 0.99, "matchType": "tokens"}
 
     best = None
     for form in forms:
@@ -359,6 +392,7 @@ textarea{min-height:140px;font-family:ui-monospace,SFMono-Regular,Menlo,monospac
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;}
 button{padding:8px 14px;border:1px solid var(--bd);border-radius:8px;background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer;}
 button.primary{background:var(--ac);border-color:var(--ac);color:var(--ac-fg);}
+button:hover{filter:brightness(1.04);}
 button:disabled{opacity:.5;cursor:not-allowed;}
 #status{min-height:18px;font-size:13px;color:var(--muted);margin-bottom:10px;}
 #status.ok{color:var(--ok);}
@@ -412,7 +446,13 @@ tr:last-child td{border-bottom:none;}
 <script>
 const STATUS=document.getElementById('status');
 const OUT=document.getElementById('out');
+const PASTE=document.getElementById('paste');
 const MONTHS=["","January","February","March","April","May","June","July","August","September","October","November","December"];
+
+const BATCH_SIZE=400;
+const RENDER_CAP=300;
+const LS_PASTE='bday-paste';
+let LAST_AGG=null;
 
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme',t);
@@ -439,6 +479,15 @@ document.getElementById('theme').addEventListener('click',()=>{
   }
   sel.value=String(cur);
 })();
+(function(){
+  const saved=localStorage.getItem(LS_PASTE);
+  if(saved) PASTE.value=saved;
+})();
+let _t=null;
+PASTE.addEventListener('input',()=>{
+  clearTimeout(_t);
+  _t=setTimeout(()=>localStorage.setItem(LS_PASTE,PASTE.value),400);
+});
 
 function setStatus(m,k){
   STATUS.innerHTML='';
@@ -453,17 +502,19 @@ function setBusy(b){
   document.getElementById('scanBtn').disabled=b;
 }
 
-function renderTable(rows,cols){
+function renderTable(rows,cols,cap){
   const t=el('table');
   const th=el('thead'),htr=el('tr');
   cols.forEach(c=>htr.appendChild(el('th',c)));
   th.appendChild(htr);t.appendChild(th);
   const tb=el('tbody');
-  if(!rows||!rows.length){
+  const total=rows?rows.length:0;
+  if(!total){
     const tr=el('tr');const td=el('td','No entries.');td.colSpan=cols.length;td.className='empty';
     tr.appendChild(td);tb.appendChild(tr);
   }else{
-    rows.forEach(r=>{
+    const shown=cap&&total>cap?rows.slice(0,cap):rows;
+    shown.forEach(r=>{
       const tr=el('tr');
       cols.forEach(c=>{
         const td=el('td');
@@ -483,6 +534,11 @@ function renderTable(rows,cols){
       });
       tb.appendChild(tr);
     });
+    if(cap&&total>cap){
+      const tr=el('tr');const td=el('td','Showing '+cap+' of '+total+' — download CSV for the full result.');
+      td.colSpan=cols.length;td.className='empty';
+      tr.appendChild(td);tb.appendChild(tr);
+    }
   }
   t.appendChild(tb);return t;
 }
@@ -493,46 +549,78 @@ function renderWorkbookResult(data){
   s.innerHTML='<span><b>'+data.count+'</b> born in <b>'+data.monthName+'</b></span>'+
     (data.elapsedMs!==undefined?'<span>'+data.elapsedMs+' ms</span>':'');
   OUT.appendChild(s);
-  OUT.appendChild(renderTable(data.rows,['Student ID','Name','Birthday']));
+  OUT.appendChild(renderTable(data.rows,['Student ID','Name','Birthday'],RENDER_CAP));
 }
 
-function renderListResult(data){
+function downloadCSV(agg){
+  if(!agg) return;
+  const rows=[['Group','Student ID','Name','Birthday','MatchType','Score']];
+  const push=(g,e)=>{
+    const s=e.student||{};
+    rows.push([g,s['Student ID']||'',s['Name']||e.line||'',s['Birthday']||'',e.matchType||'',e.score||'']);
+  };
+  agg.thisMonth.forEach(e=>push('thisMonth',e));
+  agg.matchedOther.forEach(e=>push('other',e));
+  agg.unmatched.forEach(e=>rows.push(['unmatched','',''+(e.line||''),'','','']));
+  const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
+  const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='birthdays-'+agg.monthName+'.csv';
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+
+function renderListResult(agg){
+  LAST_AGG=agg;
   OUT.innerHTML='';
   const s=el('div');s.className='summary';
-  s.innerHTML='<span><b>'+data.total+'</b> unique lines</span>'+
-    (data.duplicates&&data.duplicates.length?'<span><b>'+data.duplicates.length+'</b> duplicate(s) skipped</span>':'')+
-    '<span><b>'+data.matchedCount+'</b> matched</span>'+
-    '<span><b>'+data.thisMonthCount+'</b> in <b>'+data.monthName+'</b></span>'+
-    (data.unmatchedCount?'<span><b>'+data.unmatchedCount+'</b> unmatched</span>':'')+
-    (data.elapsedMs!==undefined?'<span>'+data.elapsedMs+' ms</span>':'');
+  s.innerHTML='<span><b>'+agg.total+'</b> unique lines</span>'+
+    (agg.duplicates&&agg.duplicates.length?'<span><b>'+agg.duplicates.length+'</b> duplicate(s) skipped</span>':'')+
+    '<span><b>'+agg.matchedCount+'</b> matched</span>'+
+    '<span><b>'+agg.thisMonthCount+'</b> in <b>'+agg.monthName+'</b></span>'+
+    (agg.unmatchedCount?'<span><b>'+agg.unmatchedCount+'</b> unmatched</span>':'')+
+    (agg.failedBatches?'<span class="bad"><b>'+agg.failedBatches+'</b> batch(es) failed</span>':'')+
+    (agg.elapsedMs!==undefined?'<span>'+agg.elapsedMs+' ms</span>':'');
   OUT.appendChild(s);
 
+  const bar=el('div');bar.className='row';bar.style.marginTop='0';
+  const btn=el('button','Download CSV (all '+agg.total+' lines)');
+  btn.onclick=()=>downloadCSV(agg);
+  bar.appendChild(btn);
+  OUT.appendChild(bar);
+
   const g1=el('div');g1.className='group';
-  g1.appendChild(el('h3','Birthday in '+data.monthName+' ('+data.thisMonth.length+')'));
-  g1.appendChild(renderTable(data.thisMonth,['Student ID','Name','Birthday','This month','Match']));
+  g1.appendChild(el('h3','Birthday in '+agg.monthName+' ('+agg.thisMonth.length+')'));
+  g1.appendChild(renderTable(agg.thisMonth,['Student ID','Name','Birthday','This month','Match'],RENDER_CAP));
   OUT.appendChild(g1);
 
-  if(data.matchedOther.length){
+  if(agg.matchedOther.length){
     const g2=el('div');g2.className='group';
-    g2.appendChild(el('h3','Other months ('+data.matchedOther.length+')'));
-    g2.appendChild(renderTable(data.matchedOther,['Student ID','Name','Birthday','This month','Match']));
+    g2.appendChild(el('h3','Other months ('+agg.matchedOther.length+')'));
+    g2.appendChild(renderTable(agg.matchedOther,['Student ID','Name','Birthday','This month','Match'],RENDER_CAP));
     OUT.appendChild(g2);
   }
 
-  if(data.unmatched.length){
+  if(agg.unmatched.length){
     const g3=el('div');g3.className='group';
-    g3.appendChild(el('h3','Unmatched ('+data.unmatched.length+')'));
+    g3.appendChild(el('h3','Unmatched ('+agg.unmatched.length+')'));
     const t=el('table');
     const th=el('thead'),htr=el('tr');
     ['Line','Reason'].forEach(c=>htr.appendChild(el('th',c)));
     th.appendChild(htr);t.appendChild(th);
     const tb=el('tbody');
-    data.unmatched.forEach(u=>{
+    const shown=agg.unmatched.length>RENDER_CAP?agg.unmatched.slice(0,RENDER_CAP):agg.unmatched;
+    shown.forEach(u=>{
       const tr=el('tr');
       tr.appendChild(el('td',u.line));
       tr.appendChild(el('td',u.error||'no match'));
       tb.appendChild(tr);
     });
+    if(agg.unmatched.length>RENDER_CAP){
+      const tr=el('tr');const td=el('td','Showing '+RENDER_CAP+' of '+agg.unmatched.length+'.');
+      td.colSpan=2;td.className='empty';tr.appendChild(td);tb.appendChild(tr);
+    }
     t.appendChild(tb);g3.appendChild(t);OUT.appendChild(g3);
   }
 }
@@ -558,36 +646,86 @@ async function scanWorkbook(){
 }
 
 async function checkList(){
-  const text=document.getElementById('paste').value;
+  const raw=PASTE.value;
   const file=document.getElementById('file').files[0];
-  if(!text.trim()&&!file){setStatus('Paste names or choose a txt file.','bad');return;}
-  setBusy(true);setStatus('Checking…','load');
-  try{
-    let r;
-    if(file){
+  if(!raw.trim()&&!file){setStatus('Paste names or choose a txt file.','bad');return;}
+
+  const month=monthSel();
+  const t0=performance.now();
+  setBusy(true);
+
+  if(file){
+    setStatus('Uploading…','load');
+    try{
       const fd=new FormData();
       fd.append('file',file);
-      fd.append('month',String(monthSel()));
-      r=await withTimeout('/birthdays/list',{method:'POST',body:fd},30000);
-    }else{
-      r=await withTimeout('/birthdays/list',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({text,month:monthSel()})
-      },30000);
+      fd.append('month',String(month));
+      const r=await withTimeout('/birthdays/list',{method:'POST',body:fd},120000);
+      const j=await r.json();
+      if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
+      j.elapsedMs=Math.round(performance.now()-t0);
+      setStatus(j.thisMonthCount+' classmate(s) have birthday in '+j.monthName+' · '+j.elapsedMs+' ms','ok');
+      renderListResult(j);
+    }catch(e){
+      setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
+    }finally{setBusy(false);}
+    return;
+  }
+
+  const lines=raw.split('\n').map(s=>s.trim()).filter(Boolean);
+  const batches=[];
+  for(let i=0;i<lines.length;i+=BATCH_SIZE) batches.push(lines.slice(i,i+BATCH_SIZE));
+
+  const agg={
+    monthName:null, total:0, rawTotal:0, duplicates:[],
+    thisMonth:[], matchedOther:[], unmatched:[],
+    failedBatches:0, batches:batches.length, doneBatches:0
+  };
+
+  try{
+    for(let b=0;b<batches.length;b++){
+      setStatus('Batch '+(b+1)+'/'+batches.length+' ('+batches[b].length+' lines)…','load');
+      try{
+        const r=await withTimeout('/birthdays/list',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({text:batches[b].join('\n'),month})
+        },60000);
+        if(!r.ok){agg.failedBatches++;continue;}
+        const j=await r.json();
+        agg.monthName=j.monthName;
+        agg.rawTotal+=j.rawTotal;
+        agg.total+=j.total;
+        agg.duplicates.push(...(j.duplicates||[]));
+        agg.thisMonth.push(...(j.thisMonth||[]));
+        agg.matchedOther.push(...(j.matchedOther||[]));
+        agg.unmatched.push(...(j.unmatched||[]));
+        agg.doneBatches=b+1;
+      }catch(e){
+        agg.failedBatches++;
+      }
     }
-    const j=await r.json();
-    if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
-    setStatus(j.thisMonthCount+' classmate(s) have birthday in '+j.monthName+' · '+j.elapsedMs+' ms','ok');
-    renderListResult(j);
-  }catch(e){
-    setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-  }finally{setBusy(false);}
+
+    agg.thisMonth.sort((a,b)=>((a.birthdayDay||99)-(b.birthdayDay||99))||String((a.student||{}).Name||'').localeCompare(String((b.student||{}).Name||'')));
+    agg.matchedOther.sort((a,b)=>((a.birthdayMonth||99)-(b.birthdayMonth||99))||((a.birthdayDay||99)-(b.birthdayDay||99)));
+    agg.matchedCount=agg.thisMonth.length+agg.matchedOther.length;
+    agg.thisMonthCount=agg.thisMonth.length;
+    agg.unmatchedCount=agg.unmatched.length;
+    agg.elapsedMs=Math.round(performance.now()-t0);
+
+    const tag=agg.failedBatches?(' · '+agg.failedBatches+' batch(es) failed'):'';
+    setStatus(agg.thisMonthCount+' classmate(s) have birthday in '+agg.monthName+' · '+agg.total+' lines · '+agg.elapsedMs+' ms'+tag,agg.failedBatches?'bad':'ok');
+    renderListResult(agg);
+  }finally{
+    setBusy(false);
+  }
 }
 
 function clearAll(){
-  document.getElementById('paste').value='';
+  PASTE.value='';
+  localStorage.removeItem(LS_PASTE);
   document.getElementById('file').value='';
+  LAST_AGG=null;
   OUT.innerHTML='<p class="empty">No data loaded.</p>';
   setStatus('');
 }
@@ -677,7 +815,7 @@ def birthdays_list():
             bd = parse_birthday(student["Birthday"]) or inline_bd
             entry.update({
                 "matched": True,
-                "rowNumber": student and idx["rows"][match["index"]]["row"],
+                "rowNumber": idx["rows"][match["index"]]["row"],
                 "score": round(match["score"], 3),
                 "matchType": match["matchType"],
                 "student": student,
@@ -731,10 +869,78 @@ def birthdays_list():
     }), 200
 
 
+@app.get("/debug/match")
+def debug_match():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "q required"}), 400
+    try:
+        idx = get_index()
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 500
+
+    forms = parse_line_forms(q)
+    by_token = idx["by_token"]
+    by_prefix = idx["by_prefix"]
+    by_sorted = idx["by_sorted"]
+
+    detail = []
+    for form in forms:
+        ftok = _tokens(form)
+        ftok_sorted = tuple(sorted(ftok))
+        cands = set()
+        for t in set(ftok):
+            cands.update(by_token.get(t, ()))
+            if len(t) >= 3:
+                cands.update(by_prefix.get(t[:3], ()))
+        scored = []
+        for i in list(cands)[:20]:
+            sc, mt = name_match_score(form, idx["rows"][i]["name"])
+            scored.append({"index": i, "row": idx["rows"][i]["row"],
+                           "name": idx["rows"][i]["name"],
+                           "score": round(sc, 3), "matchType": mt})
+        scored.sort(key=lambda x: -x["score"])
+        detail.append({
+            "form": form,
+            "tokens": ftok,
+            "sorted_key_hit": bool(by_sorted.get(ftok_sorted)),
+            "top_candidates": scored[:5],
+        })
+
+    win = match_index(idx, q)
+    return jsonify({
+        "query": q,
+        "forms": detail,
+        "winner": None if not win else {
+            "index": win["index"], "row": idx["rows"][win["index"]]["row"],
+            "name": idx["rows"][win["index"]]["name"],
+            "score": win["score"], "matchType": win["matchType"],
+        },
+        "index_size": len(idx["rows"]),
+    }), 200
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
 
+@app.get("/healthz")
+def healthz():
+    try:
+        idx = get_index()
+        return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH}), 200
+    except FileNotFoundError as e:
+        return jsonify({"ok": False, "error": str(e), "path": XLSX_PATH}), 503
+
+
+if os.path.exists(XLSX_PATH):
+    try:
+        get_index()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
