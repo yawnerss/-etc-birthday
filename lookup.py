@@ -15,6 +15,9 @@ from openpyxl import load_workbook
 
 GITHUB_RAW = os.environ.get("XLSX_URL", "").strip()
 
+# Columns surfaced in every response. Password is deliberately excluded.
+VISIBLE = ["Student ID", "Name", "Birthday", "Campus", "Program"]
+
 
 def resolve_xlsx_path():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -258,24 +261,27 @@ def _load_index():
         id_i = col("Student ID", "StudentID", "ID")
         name_i = col("Name")
         bd_i = col("Birthday")
+        campus_i = col("Campus")
+        prog_i = col("Program", "Course")
 
         if name_i is None:
-            raise ValueError(
-                f"header 'Name' not found. Got headers: {list(headers.keys())}"
-            )
+            raise ValueError(f"header 'Name' not found. Got headers: {list(headers.keys())}")
 
         rows, by_id, by_token, by_prefix = [], {}, {}, {}
         for r_idx, row in enumerate(it, start=2):
             if row is None:
                 continue
-            sid = row[id_i] if id_i is not None and id_i < len(row) else None
-            nm = row[name_i] if name_i is not None and name_i < len(row) else None
-            bd = row[bd_i] if bd_i is not None and bd_i < len(row) else None
-            sid_s = _cell_to_str(sid)
-            nm_s = _cell_to_str(nm)
+
+            def cell(i):
+                if i is None or i >= len(row):
+                    return None
+                return row[i]
+
+            sid_s = _cell_to_str(cell(id_i))
+            nm_s = _cell_to_str(cell(name_i))
             if not sid_s and not nm_s:
                 continue
-            bd_s = _cell_to_str(bd)
+            bd_s = _cell_to_str(cell(bd_i))
             bd_parsed = parse_birthday(bd_s)
             name_tokens = _tokens(nm_s) if nm_s else []
             id_folded = re.sub(r"\s+", " ", _fold(sid_s)).strip() if sid_s else ""
@@ -286,6 +292,8 @@ def _load_index():
                 "id": sid_s,
                 "name": nm_s,
                 "birthday": bd_s,
+                "campus": _cell_to_str(cell(campus_i)),
+                "program": _cell_to_str(cell(prog_i)),
                 "birthday_month": bd_parsed.month if bd_parsed else None,
                 "birthday_day": bd_parsed.day if bd_parsed else None,
                 "name_tokens": tuple(name_tokens),
@@ -385,22 +393,28 @@ def match_index(idx, line, min_score=FUZZY_MIN):
     return None
 
 
-def full_student(idx, i):
-    row = idx["rows"][i]
-    m_name = _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else ""
+def row_to_public(row):
+    """Map an index row to the public field set (VISIBLE order)."""
     return {
         "Student ID": row["id"],
         "Name": row["name"],
         "Birthday": row["birthday"],
-        "Month": m_name,
-        "Day": row["birthday_day"] if row["birthday_day"] is not None else "",
-        "_row": row["row"],
+        "Campus": row["campus"],
+        "Program": row["program"],
     }
 
 
-def student_from_index(idx, i):
+def full_student(idx, i):
     row = idx["rows"][i]
-    return {"Student ID": row["id"], "Name": row["name"], "Birthday": row["birthday"]}
+    out = row_to_public(row)
+    out["Month"] = _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else ""
+    out["Day"] = row["birthday_day"] if row["birthday_day"] is not None else ""
+    out["_row"] = row["row"]
+    return out
+
+
+def student_from_index(idx, i):
+    return row_to_public(idx["rows"][i])
 
 
 def resolve_month(raw):
@@ -438,569 +452,453 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Birthdays</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#fbfbfa">
+<meta name="color-scheme" content="light dark">
+<title>Lookup</title>
 <style>
-:root{--bg:#fff;--panel:#fafafa;--bd:#e5e7eb;--fg:#111827;--muted:#6b7280;--ac:#2563eb;--ac-fg:#fff;--ok:#15803d;--bad:#b91c1c;--chip:#f3f4f6;}
-html[data-theme="dark"]{--bg:#0b0d10;--panel:#121519;--bd:#22272e;--fg:#e6edf3;--muted:#8b949e;--ac:#58a6ff;--ac-fg:#0b0d10;--ok:#3fb950;--bad:#f85149;--chip:#1c2128;}
-*{box-sizing:border-box;}
+:root{
+  --bg:#fbfbfa;--surface:#ffffff;--line:#ebebe8;--fg:#161615;--muted:#8a8a84;
+  --accent:#161615;--accent-fg:#ffffff;--soft:#f3f3f0;--ok:#2f7d4f;--bad:#c0392b;
+  --r:16px;
+}
+html[data-theme="dark"]{
+  --bg:#0f0f10;--surface:#171718;--line:#262628;--fg:#ececea;--muted:#7d7d82;
+  --accent:#ececea;--accent-fg:#0f0f10;--soft:#1e1e20;--ok:#5fc08a;--bad:#f0776b;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
 html,body{margin:0;background:var(--bg);color:var(--fg);}
-body{font:14px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased;}
-header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:var(--bg);z-index:10;gap:12px;}
-header h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.01em;}
-.hbtns{display:flex;align-items:center;gap:8px;}
-#serverStatus{font-size:11px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
-.toggle{border:1px solid var(--bd);border-radius:8px;background:var(--panel);color:var(--fg);padding:6px 10px;font:inherit;font-size:13px;cursor:pointer;display:inline-flex;gap:6px;align-items:center;}
-.toggle:hover{border-color:var(--muted);}
-main{max-width:1200px;margin:0 auto;padding:20px;}
-section{margin-bottom:24px;}
-h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 10px;}
-.field{display:flex;flex-direction:column;gap:4px;}
-.field label{font-size:12px;color:var(--muted);}
-input,select,textarea{width:100%;padding:8px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--panel);color:var(--fg);font:inherit;}
-input:focus,select:focus,textarea:focus{outline:2px solid var(--ac);outline-offset:-1px;}
-textarea{min-height:140px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;resize:vertical;white-space:pre;}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;}
-button{padding:8px 14px;border:1px solid var(--bd);border-radius:8px;background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer;}
-button.primary{background:var(--ac);border-color:var(--ac);color:var(--ac-fg);}
-button:hover{filter:brightness(1.04);}
-button:disabled{opacity:.5;cursor:not-allowed;}
-#status{min-height:18px;font-size:13px;color:var(--muted);margin-bottom:10px;white-space:pre-wrap;word-break:break-word;}
-#status.ok{color:var(--ok);}
+body{
+  font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+  -webkit-font-smoothing:antialiased;
+  padding-bottom:calc(84px + env(safe-area-inset-bottom));
+}
+.wrap{max-width:640px;margin:0 auto;padding:0 18px;}
+
+/* header */
+header{
+  position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  padding-top:env(safe-area-inset-top);
+}
+.bar{display:flex;align-items:center;justify-content:space-between;height:60px;}
+.brand{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:600;letter-spacing:-.01em;}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);transition:background .2s;}
+.dot.ok{background:var(--ok);}
+.dot.bad{background:var(--bad);}
+.icon-btn{
+  width:44px;height:44px;border-radius:50%;border:0;background:transparent;color:var(--fg);
+  font-size:18px;display:grid;place-items:center;cursor:pointer;
+}
+.icon-btn:active{background:var(--soft);}
+
+/* panels */
+.panel{display:none;padding-top:8px;animation:fade .18s ease;}
+.panel.on{display:block;}
+@keyframes fade{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}
+.lead{font-size:26px;font-weight:650;letter-spacing:-.02em;margin:8px 0 18px;line-height:1.2;}
+.lead span{color:var(--muted);font-weight:500;}
+
+/* inputs: 16px to stop Android/Chrome zoom, 52px tall for thumbs */
+input,select,textarea{
+  width:100%;font:inherit;font-size:16px;color:var(--fg);background:var(--surface);
+  border:1px solid var(--line);border-radius:var(--r);padding:0 16px;height:52px;
+  outline:none;transition:border-color .15s,box-shadow .15s;appearance:none;-webkit-appearance:none;
+}
+input:focus,select:focus,textarea:focus{border-color:var(--fg);box-shadow:0 0 0 3px color-mix(in srgb,var(--fg) 8%,transparent);}
+textarea{height:auto;min-height:170px;padding:14px 16px;resize:vertical;line-height:1.55;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;}
+select{
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none' stroke='%238a8a84' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 18px center;padding-right:44px;
+}
+.stack{display:flex;flex-direction:column;gap:10px;}
+.btn{
+  height:52px;border-radius:var(--r);border:1px solid var(--line);background:var(--surface);color:var(--fg);
+  font:inherit;font-size:15px;font-weight:600;cursor:pointer;padding:0 20px;width:100%;
+  transition:transform .08s,opacity .15s;
+}
+.btn:active{transform:scale(.985);}
+.btn.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);}
+.btn.ghost{background:transparent;}
+.btn:disabled{opacity:.45;pointer-events:none;}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.filebtn{display:flex;align-items:center;justify-content:center;gap:8px;height:52px;border-radius:var(--r);
+  border:1px dashed var(--line);color:var(--muted);font-size:14px;cursor:pointer;background:transparent;}
+.filebtn input{display:none;}
+
+/* results */
+#status{min-height:20px;font-size:13px;color:var(--muted);margin:22px 0 4px;word-break:break-word;}
+#status.ok{color:var(--muted);}
 #status.bad{color:var(--bad);}
-.spinner{display:inline-block;width:10px;height:10px;border:2px solid var(--muted);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px;}
-@keyframes spin{to{transform:rotate(360deg);}}
-.summary{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;font-size:13px;color:var(--muted);}
-.summary b{color:var(--fg);font-weight:600;}
-table{width:100%;border-collapse:collapse;font-size:13px;}
-th,td{border-bottom:1px solid var(--bd);padding:8px 10px;text-align:left;vertical-align:top;}
-th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;}
-td{word-break:break-word;}
-tr:last-child td{border-bottom:none;}
-.chip{display:inline-block;padding:1px 8px;border-radius:999px;background:var(--chip);color:var(--muted);font-size:11px;font-weight:500;}
-.chip.on{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok);}
-.empty{color:var(--muted);font-style:italic;}
-.group h3{font-size:12px;font-weight:600;color:var(--muted);margin:16px 0 6px;text-transform:uppercase;letter-spacing:.06em;}
-.card{border:1px solid var(--bd);border-radius:10px;background:var(--panel);padding:16px;}
-.card .kv{display:grid;grid-template-columns:140px 1fr;gap:6px 12px;font-size:13px;}
-.card .kv .k{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em;}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--muted);border-top-color:transparent;
+  border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:8px;}
+@keyframes sp{to{transform:rotate(360deg);}}
+.sum{display:flex;gap:6px 14px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin:10px 0 12px;}
+.sum b{color:var(--fg);font-weight:600;}
+.h3{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:26px 0 10px;}
+.list{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;}
+.item{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:flex-start;}
+.item:last-child{border-bottom:0;}
+.item .body{flex:1;min-width:0;}
+.item .nm{font-weight:600;font-size:15px;overflow-wrap:anywhere;}
+.item .mt{font-size:13px;color:var(--muted);margin-top:2px;overflow-wrap:anywhere;}
+.badge{flex:none;min-width:46px;text-align:center;padding:5px 9px;border-radius:12px;background:var(--soft);
+  font-size:12px;font-weight:600;line-height:1.25;}
+.badge small{display:block;font-size:10px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;}
+.badge.hot{background:var(--accent);color:var(--accent-fg);}
+.badge.hot small{color:inherit;opacity:.7;}
+.tag{display:inline-block;font-size:11px;color:var(--muted);background:var(--soft);padding:1px 8px;border-radius:999px;margin-top:6px;}
+.empty{color:var(--muted);text-align:center;padding:36px 12px;font-size:14px;}
+.err{border:1px solid var(--bad);border-radius:var(--r);padding:12px 14px;color:var(--bad);font-size:13px;margin-bottom:12px;word-break:break-word;}
+.kv{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:6px 16px;}
+.kv div{display:flex;justify-content:space-between;gap:16px;padding:11px 0;border-bottom:1px solid var(--line);font-size:14px;}
+.kv div:last-child{border-bottom:0;}
+.kv span:first-child{color:var(--muted);flex:none;}
+.kv span:last-child{text-align:right;font-weight:500;overflow-wrap:anywhere;}
+.more{margin-top:12px;}
+
+/* bottom nav (thumb zone) */
+nav{
+  position:fixed;left:0;right:0;bottom:0;z-index:30;background:color-mix(in srgb,var(--bg) 90%,transparent);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--line);
+  padding-bottom:env(safe-area-inset-bottom);
+}
+nav .in{display:grid;grid-template-columns:repeat(3,1fr);max-width:640px;margin:0 auto;}
+nav button{
+  height:64px;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11px;font-weight:600;
+  letter-spacing:.02em;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;
+}
+nav button .i{font-size:20px;line-height:1;}
+nav button.on{color:var(--fg);}
+nav button:active{background:var(--soft);}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
 </style>
 </head>
 <body>
 <header>
-  <h1>Birthdays</h1>
-  <div class="hbtns">
-    <span id="serverStatus">●</span>
-    <button class="toggle" id="theme"><span id="theme-ico">◐</span> <span id="theme-txt">Dark</span></button>
+  <div class="wrap bar">
+    <div class="brand"><span class="dot" id="dot"></span><span>Lookup</span><span id="count" style="font-size:12px;color:var(--muted);font-weight:500"></span></div>
+    <button class="icon-btn" id="theme" aria-label="Toggle theme">◐</button>
   </div>
 </header>
-<main>
-<section>
-  <h2>Single student lookup</h2>
-  <div class="grid">
-    <div class="field">
-      <label for="single">Name or Student ID</label>
-      <input id="single" placeholder="IGARTA ALVIN · ALVIN IGARTA · 26-05959" autocomplete="off">
+
+<main class="wrap">
+
+  <section class="panel on" id="p-find">
+    <h1 class="lead">Find a student<br><span>by name or ID</span></h1>
+    <div class="stack">
+      <input id="single" placeholder="Name or student ID" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+      <button class="btn primary" id="singleBtn">Search</button>
     </div>
-  </div>
-  <div class="row"><button class="primary" id="singleBtn" onclick="lookupSingle()">Look up</button></div>
-</section>
-<section>
-  <h2>Scan workbook</h2>
-  <div class="grid">
-    <div class="field"><label for="month">Month</label><select id="month"></select></div>
-  </div>
-  <div class="row">
-    <button class="primary" id="scanBtn" onclick="scanWorkbook()">Scan month</button>
-    <button class="primary" id="allBtn" onclick="scanAll()">Scan whole file</button>
-  </div>
-</section>
-<section>
-  <h2>Classmate list</h2>
-  <div class="field">
-    <label for="paste">Paste names / IDs / txt lines (one per line — tab, comma, or multi-space separated)</label>
-    <textarea id="paste" placeholder="BALINO&#9;HERIE-JAY&#10;BANGAYAN&#9;DOMINIC&#10;IGARTA&#9;ALVIN&#10;26-05959"></textarea>
-  </div>
-  <div class="row">
-    <input type="file" id="file" accept=".txt,text/plain" style="max-width:240px">
-    <button class="primary" id="checkBtn" onclick="checkList()">Check list</button>
-    <button onclick="clearAll()">Clear</button>
-  </div>
-</section>
-<section>
-  <h2>Result</h2>
+  </section>
+
+  <section class="panel" id="p-month">
+    <h1 class="lead">Birthdays<br><span>by month</span></h1>
+    <div class="stack">
+      <select id="month" aria-label="Month"></select>
+      <button class="btn primary" id="scanBtn">Show this month</button>
+      <button class="btn ghost" id="allBtn">Browse everyone</button>
+    </div>
+  </section>
+
+  <section class="panel" id="p-list">
+    <h1 class="lead">Class list<br><span>check birthdays</span></h1>
+    <div class="stack">
+      <textarea id="paste" wrap="off" placeholder="One per line&#10;BALINO&#9;HERIE-JAY&#10;IGARTA ALVIN&#10;26-05959" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+      <label class="filebtn"><input type="file" id="file" accept=".txt,text/plain"><span id="fileLbl">＋ Attach .txt file</span></label>
+      <div class="row2">
+        <button class="btn ghost" id="clearBtn">Clear</button>
+        <button class="btn primary" id="checkBtn">Check</button>
+      </div>
+    </div>
+  </section>
+
   <div id="status"></div>
-  <div id="out"><p class="empty">No data loaded.</p></div>
-</section>
+  <div id="out"></div>
 </main>
+
+<nav><div class="in">
+  <button data-tab="find" class="on"><span class="i">⌕</span>Find</button>
+  <button data-tab="month"><span class="i">◷</span>Month</button>
+  <button data-tab="list"><span class="i">☰</span>List</button>
+</div></nav>
+
 <script>
-const STATUS=document.getElementById('status');
-const OUT=document.getElementById('out');
-const PASTE=document.getElementById('paste');
-const SINGLE=document.getElementById('single');
-const SERVER_STATUS=document.getElementById('serverStatus');
+const $=id=>document.getElementById(id);
+const STATUS=$('status'),OUT=$('out'),PASTE=$('paste'),SINGLE=$('single');
 const MONTHS=["","January","February","March","April","May","June","July","August","September","October","November","December"];
+const BATCH_SIZE=400,RENDER_CAP=200,LS_PASTE='bday-paste';
+let LAST_ALL=null;
 
-const BATCH_SIZE=400;
-const RENDER_CAP=300;
-const LS_PASTE='bday-paste';
+function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!==undefined&&x!==null)e.textContent=x;return e;}
+function safe(f){try{return f();}catch(_){return null;}}
 
+/* theme */
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme',t);
-  document.getElementById('theme-txt').textContent=t==='dark'?'Light':'Dark';
-  document.getElementById('theme-ico').textContent=t==='dark'?'☀':'◐';
-  localStorage.setItem('bday-theme',t);
+  $('theme').textContent=t==='dark'?'☀':'◐';
+  const m=document.querySelector('meta[name=theme-color]');
+  if(m)m.setAttribute('content',t==='dark'?'#0f0f10':'#fbfbfa');
+  safe(()=>localStorage.setItem('bday-theme',t));
 }
-(function(){
-  const saved=localStorage.getItem('bday-theme');
-  const sys=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
-  applyTheme(saved||sys);
-})();
-document.getElementById('theme').addEventListener('click',()=>{
-  applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');
-});
-(function(){
-  const sel=document.getElementById('month');
-  const cur=new Date().getMonth()+1;
-  for(let i=1;i<=12;i++){
-    const o=document.createElement('option');
-    o.value=String(i);
-    o.textContent=MONTHS[i]+(i===cur?' (current)':'');
-    sel.appendChild(o);
-  }
-  sel.value=String(cur);
-})();
-(function(){
-  const saved=localStorage.getItem(LS_PASTE);
-  if(saved) PASTE.value=saved;
-})();
-let _t=null;
-PASTE.addEventListener('input',()=>{
-  clearTimeout(_t);
-  _t=setTimeout(()=>localStorage.setItem(LS_PASTE,PASTE.value),400);
+applyTheme(safe(()=>localStorage.getItem('bday-theme'))||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));
+$('theme').onclick=()=>applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');
+
+/* tabs */
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.id==='p-'+b.dataset.tab));
+  window.scrollTo({top:0,behavior:'smooth'});
 });
 
-async function checkServerStatus(){
-  SERVER_STATUS.style.color='var(--muted)';
-  SERVER_STATUS.textContent='● checking';
-  try{
-    const r=await fetch('/healthz',{cache:'no-store'});
-    const j=await r.json();
-    if(j.ok){
-      SERVER_STATUS.style.color='var(--ok)';
-      SERVER_STATUS.textContent='● '+j.rows+' rows';
-      SERVER_STATUS.title=j.path||'';
-    }else{
-      SERVER_STATUS.style.color='var(--bad)';
-      SERVER_STATUS.textContent='● '+((j.error||'error').slice(0,60));
-      SERVER_STATUS.title=(j.error||'')+'\n'+(j.path||'');
-    }
-  }catch(e){
-    SERVER_STATUS.style.color='var(--bad)';
-    SERVER_STATUS.textContent='● offline';
-    SERVER_STATUS.title=String(e);
+/* month select */
+(function(){
+  const cur=new Date().getMonth()+1,sel=$('month');
+  for(let i=1;i<=12;i++){
+    const o=document.createElement('option');o.value=i;
+    o.textContent=MONTHS[i]+(i===cur?'  ·  now':'');sel.appendChild(o);
   }
+  sel.value=cur;
+})();
+const monthSel=()=>parseInt($('month').value,10);
+
+/* paste persistence */
+const saved=safe(()=>localStorage.getItem(LS_PASTE));if(saved)PASTE.value=saved;
+let _t=null;
+PASTE.addEventListener('input',()=>{clearTimeout(_t);_t=setTimeout(()=>safe(()=>localStorage.setItem(LS_PASTE,PASTE.value)),400);});
+$('file').onchange=e=>{$('fileLbl').textContent=e.target.files[0]?('✓ '+e.target.files[0].name):'＋ Attach .txt file';};
+
+/* server status */
+async function checkServer(){
+  const d=$('dot');d.className='dot';
+  try{
+    const j=await (await fetch('/healthz',{cache:'no-store'})).json();
+    d.className='dot '+(j.ok?'ok':'bad');
+    $('count').textContent=j.ok?(j.rows+' students'):'';
+    d.title=j.ok?'':(j.error||'error');
+  }catch(e){d.className='dot bad';$('count').textContent='offline';}
 }
-checkServerStatus();
+checkServer();
 
 function setStatus(m,k){
   STATUS.innerHTML='';
-  if(k==='load'){STATUS.appendChild(Object.assign(document.createElement('span'),{className:'spinner'}));}
+  if(k==='load')STATUS.appendChild(el('span','spin'));
   STATUS.appendChild(document.createTextNode(m||''));
-  STATUS.className=(k==='load')?'':(k||'');
+  STATUS.className=k==='load'?'':(k||'');
 }
-function el(t,x){const e=document.createElement(t);if(x!==undefined)e.textContent=x;return e;}
-function monthSel(){return parseInt(document.getElementById('month').value,10);}
-function setBusy(b){
-  document.getElementById('checkBtn').disabled=b;
-  document.getElementById('scanBtn').disabled=b;
-  document.getElementById('allBtn').disabled=b;
-  document.getElementById('singleBtn').disabled=b;
-}
+function setBusy(b){['checkBtn','scanBtn','allBtn','singleBtn'].forEach(id=>$(id).disabled=b);}
 
-function renderTable(rows,cols,cap){
-  const t=el('table');
-  const th=el('thead'),htr=el('tr');
-  cols.forEach(c=>htr.appendChild(el('th',c)));
-  th.appendChild(htr);t.appendChild(th);
-  const tb=el('tbody');
-  const total=rows?rows.length:0;
-  if(!total){
-    const tr=el('tr');const td=el('td','No entries.');td.colSpan=cols.length;td.className='empty';
-    tr.appendChild(td);tb.appendChild(tr);
-  }else{
-    const shown=cap&&total>cap?rows.slice(0,cap):rows;
-    shown.forEach(r=>{
-      const tr=el('tr');
-      cols.forEach(c=>{
-        const td=el('td');
-        if(c==='This month'){
-          const chip=el('span',r.thisMonth?'Yes':'No');
-          chip.className='chip'+(r.thisMonth?' on':'');
-          td.appendChild(chip);
-        }else if(c==='Match'){
-          if(r.matched){const chip=el('span',r.matchType+' · '+r.score);chip.className='chip';td.appendChild(chip);}
-          else if(r.matchType==='inline'){const chip=el('span','inline date');chip.className='chip';td.appendChild(chip);}
-          else{td.textContent='—';}
-        }else{
-          const src=r.student&&r.student[c]!==undefined?r.student[c]:r[c];
-          td.textContent=src===undefined||src===null?'':String(src);
-        }
-        tr.appendChild(td);
-      });
-      tb.appendChild(tr);
-    });
-    if(cap&&total>cap){
-      const tr=el('tr');const td=el('td','Showing '+cap+' of '+total+' — download CSV for the full result.');
-      td.colSpan=cols.length;td.className='empty';
-      tr.appendChild(td);tb.appendChild(tr);
-    }
-  }
-  t.appendChild(tb);return t;
+/* components */
+function meta(s){
+  const a=[s['Student ID'],s['Birthday']].filter(Boolean).join(' · ');
+  const b=[s['Campus'],s['Program']].filter(Boolean).join(' · ');
+  return [a,b];
 }
-
+function badge(month,day,hot){
+  if(!day&&!month)return null;
+  const b=el('div','badge'+(hot?' hot':''));
+  b.appendChild(document.createTextNode(day||'–'));
+  b.appendChild(el('small',null,month?MONTHS[month].slice(0,3):''));
+  return b;
+}
+function item(s,opts){
+  opts=opts||{};
+  const it=el('div','item');
+  const body=el('div','body');
+  body.appendChild(el('div','nm',s['Name']||opts.fallback||'—'));
+  const m=meta(s);
+  if(m[0])body.appendChild(el('div','mt',m[0]));
+  if(m[1])body.appendChild(el('div','mt',m[1]));
+  if(opts.tag)body.appendChild(el('span','tag',opts.tag));
+  it.appendChild(body);
+  const b=badge(opts.month,opts.day,opts.hot);
+  if(b)it.appendChild(b);
+  return it;
+}
+function listOf(rows,fn,cap){
+  const box=el('div','list');
+  if(!rows.length){box.appendChild(el('div','empty','Nothing here.'));return box;}
+  (cap&&rows.length>cap?rows.slice(0,cap):rows).forEach(r=>box.appendChild(fn(r)));
+  if(cap&&rows.length>cap)box.appendChild(el('div','empty','Showing '+cap+' of '+rows.length+' — use CSV for all.'));
+  return box;
+}
+function sum(parts){
+  const s=el('div','sum');
+  parts.forEach(p=>{const sp=el('span');sp.innerHTML=p;s.appendChild(sp);});
+  return s;
+}
+function esc(x){return String(x==null?'':x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function csvDownload(rows,name){
   const csv=rows.map(r=>r.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\n');
-  const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
   const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
-  a.download=name;
-  a.click();
-  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+  a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
+function csvBtn(label,fn){const b=el('button','btn ghost more',label);b.onclick=fn;return b;}
 
-function renderSingle(data){
+/* renderers */
+function renderSingle(d){
   OUT.innerHTML='';
-  const s=el('div');s.className='summary';
-  s.innerHTML='<span>matched <b>'+data.matchType+'</b> · score <b>'+data.score+'</b></span>'+
-    '<span>row <b>'+data.student._row+'</b></span>'+
-    '<span>query <b>'+data.query+'</b></span>'+
-    (data.elapsedMs!==undefined?'<span>'+data.elapsedMs+' ms</span>':'');
-  OUT.appendChild(s);
-
-  const card=el('div');card.className='card';
-  const kv=el('div');kv.className='kv';
-  const rows=[
-    ['Student ID', data.student['Student ID']],
-    ['Name', data.student['Name']],
-    ['Birthday', data.student['Birthday']],
-    ['Month', data.student['Month']],
-    ['Day', data.student['Day']],
-    ['Row', data.student._row],
-  ];
-  rows.forEach(([k,v])=>{
-    kv.appendChild(el('div',k)).className='k';
-    kv.appendChild(el('div',v===''||v==null?'—':String(v)));
+  const s=d.student;
+  OUT.appendChild(sum(['match <b>'+esc(d.matchType)+'</b>','score <b>'+esc(d.score)+'</b>','row <b>'+esc(s._row)+'</b>']));
+  const kv=el('div','kv');
+  [['Student ID',s['Student ID']],['Name',s['Name']],['Birthday',s['Birthday']],['Campus',s['Campus']],
+   ['Program',s['Program']],['Month',s['Month']],['Day',s['Day']]].forEach(([k,v])=>{
+    const r=el('div');r.appendChild(el('span',null,k));r.appendChild(el('span',null,v===''||v==null?'—':v));kv.appendChild(r);
   });
-  card.appendChild(kv);
-  OUT.appendChild(card);
-
-  const bar=el('div');bar.className='row';
-  const btn=el('button','Copy JSON');
-  btn.onclick=()=>navigator.clipboard.writeText(JSON.stringify(data.student,null,2));
-  bar.appendChild(btn);
-  OUT.appendChild(bar);
+  OUT.appendChild(kv);
+  OUT.appendChild(csvBtn('Copy details',()=>navigator.clipboard&&navigator.clipboard.writeText(JSON.stringify(s,null,2))));
 }
-
-function renderWorkbookResult(data){
+function renderMonth(d){
   OUT.innerHTML='';
-  const s=el('div');s.className='summary';
-  s.innerHTML='<span><b>'+data.count+'</b> born in <b>'+data.monthName+'</b></span>'+
-    (data.elapsedMs!==undefined?'<span>'+data.elapsedMs+' ms</span>':'');
-  OUT.appendChild(s);
-  OUT.appendChild(renderTable(data.rows,['Student ID','Name','Birthday'],RENDER_CAP));
+  OUT.appendChild(sum(['<b>'+d.count+'</b> in <b>'+esc(d.monthName)+'</b>']));
+  const mi=MONTHS.indexOf(d.monthName);
+  OUT.appendChild(listOf(d.rows,r=>item(r,{month:mi,day:r.day,hot:true}),RENDER_CAP));
 }
-
-function renderAllResult(data){
-  OUT.innerHTML='';
-  const s=el('div');s.className='summary';
-  s.innerHTML='<span><b>'+data.count+'</b> total row(s)</span>'+
-    '<span>sheet <b>'+data.sheet+'</b></span>'+
-    (data.elapsedMs!==undefined?'<span>'+data.elapsedMs+' ms</span>':'');
-  OUT.appendChild(s);
-
-  const bar=el('div');bar.className='row';bar.style.marginTop='0';
-  const btn=el('button','Download CSV ('+data.count+' rows)');
-  btn.onclick=()=>{
-    const rows=[['Student ID','Name','Birthday','Month','Day']];
-    data.rows.forEach(r=>rows.push([r['Student ID'],r['Name'],r['Birthday'],r['Month'],r['Day']]));
-    csvDownload(rows,'ofes-all.csv');
-  };
-  bar.appendChild(btn);
-  OUT.appendChild(bar);
-
-  const bar2=el('div');bar2.className='row';bar2.style.marginTop='8px';
-  const filt=el('input');
-  filt.placeholder='Filter by name / ID / month…';
-  filt.style.maxWidth='340px';
-  bar2.appendChild(filt);
-  OUT.appendChild(bar2);
-
-  const holder=el('div');
-  OUT.appendChild(holder);
-
-  const draw=(q)=>{
-    const qq=(q||'').trim().toLowerCase();
-    const filtered=qq
-      ? data.rows.filter(r=>
-          String(r['Student ID']).toLowerCase().includes(qq)||
-          String(r['Name']).toLowerCase().includes(qq)||
-          String(r['Month']).toLowerCase().includes(qq)||
-          String(r['Birthday']).toLowerCase().includes(qq))
-      : data.rows;
+function renderAll(d){
+  LAST_ALL=d;OUT.innerHTML='';
+  OUT.appendChild(sum(['<b>'+d.count+'</b> students']));
+  const f=el('input');f.placeholder='Filter name, ID, campus, month…';f.setAttribute('autocapitalize','off');
+  OUT.appendChild(f);
+  const holder=el('div');holder.style.marginTop='12px';OUT.appendChild(holder);
+  const cols=['Student ID','Name','Birthday','Campus','Program','Month','Day'];
+  const draw=q=>{
+    q=(q||'').trim().toLowerCase();
+    const rows=q?d.rows.filter(r=>cols.some(c=>String(r[c]).toLowerCase().includes(q))):d.rows;
     holder.innerHTML='';
-    const sub=el('div');sub.className='summary';
-    sub.innerHTML='<span>showing <b>'+Math.min(filtered.length,RENDER_CAP)+'</b> of <b>'+filtered.length+'</b></span>';
-    holder.appendChild(sub);
-    holder.appendChild(renderTable(filtered,['Student ID','Name','Birthday','Month','Day'],RENDER_CAP));
+    holder.appendChild(sum(['showing <b>'+Math.min(rows.length,RENDER_CAP)+'</b> of <b>'+rows.length+'</b>']));
+    holder.appendChild(listOf(rows,r=>item(r,{month:MONTHS.indexOf(r.Month),day:r.Day}),RENDER_CAP));
   };
-  filt.addEventListener('input',()=>draw(filt.value));
-  draw('');
+  f.oninput=()=>draw(f.value);draw('');
+  OUT.appendChild(csvBtn('Download CSV',()=>{
+    const rows=[cols];d.rows.forEach(r=>rows.push(cols.map(c=>r[c])));csvDownload(rows,'students-all.csv');
+  }));
 }
-
-function downloadAggCSV(agg){
-  if(!agg) return;
-  const rows=[['Group','Student ID','Name','Birthday','MatchType','Score']];
-  const push=(g,e)=>{
-    const s=e.student||{};
-    rows.push([g,s['Student ID']||'',s['Name']||e.line||'',s['Birthday']||'',e.matchType||'',e.score||'']);
-  };
-  agg.thisMonth.forEach(e=>push('thisMonth',e));
-  agg.matchedOther.forEach(e=>push('other',e));
-  agg.unmatched.forEach(e=>rows.push(['unmatched','',''+(e.line||''),'','','']));
-  csvDownload(rows,'birthdays-'+agg.monthName+'.csv');
-}
-
-function renderListResult(agg){
+function renderList(a){
   OUT.innerHTML='';
-  const s=el('div');s.className='summary';
-  s.innerHTML='<span><b>'+agg.total+'</b> unique lines</span>'+
-    (agg.duplicates&&agg.duplicates.length?'<span><b>'+agg.duplicates.length+'</b> duplicate(s) skipped</span>':'')+
-    '<span><b>'+agg.matchedCount+'</b> matched</span>'+
-    '<span><b>'+agg.thisMonthCount+'</b> in <b>'+(agg.monthName||'—')+'</b></span>'+
-    (agg.unmatchedCount?'<span><b>'+agg.unmatchedCount+'</b> unmatched</span>':'')+
-    (agg.failedBatches?'<span class="bad"><b>'+agg.failedBatches+'</b> batch(es) failed</span>':'')+
-    (agg.elapsedMs!==undefined?'<span>'+agg.elapsedMs+' ms</span>':'');
-  OUT.appendChild(s);
+  const p=['<b>'+a.total+'</b> lines','<b>'+a.matchedCount+'</b> matched','<b>'+a.thisMonthCount+'</b> in <b>'+esc(a.monthName||'—')+'</b>'];
+  if(a.duplicates&&a.duplicates.length)p.push('<b>'+a.duplicates.length+'</b> duplicates skipped');
+  if(a.unmatchedCount)p.push('<b>'+a.unmatchedCount+'</b> unmatched');
+  OUT.appendChild(sum(p));
+  if(a.lastError)OUT.appendChild(el('div','err','Server error: '+a.lastError));
+  if(!a.matchedCount&&!a.unmatchedCount)return;
 
-  if(agg.lastError){
-    const e=el('div');e.className='card';
-    e.style.borderColor='var(--bad)';
-    const kv=el('div');kv.className='kv';
-    kv.appendChild(el('div','Server error')).className='k';
-    kv.appendChild(el('div',agg.lastError));
-    e.appendChild(kv);
-    OUT.appendChild(e);
-    OUT.appendChild(el('div')).style.height='12px';
+  const mk=(e,hot)=>item(e.student||{},{fallback:e.line,month:e.birthdayMonth,day:e.birthdayDay,hot:hot,
+    tag:e.matchType==='inline'?'date from line':(e.matched&&e.matchType!=='id'&&e.matchType!=='exact'?e.matchType+' · '+e.score:null)});
+
+  OUT.appendChild(el('div','h3','Birthday in '+(a.monthName||'—')+' · '+a.thisMonth.length));
+  OUT.appendChild(listOf(a.thisMonth,e=>mk(e,true),RENDER_CAP));
+  if(a.matchedOther.length){
+    OUT.appendChild(el('div','h3','Other months · '+a.matchedOther.length));
+    OUT.appendChild(listOf(a.matchedOther,e=>mk(e,false),RENDER_CAP));
   }
-
-  if(!agg.matchedCount && !agg.unmatchedCount){
-    return;
+  if(a.unmatched.length){
+    OUT.appendChild(el('div','h3','Unmatched · '+a.unmatched.length));
+    OUT.appendChild(listOf(a.unmatched,u=>{
+      const it=el('div','item'),b=el('div','body');
+      b.appendChild(el('div','nm',u.line));b.appendChild(el('div','mt',u.error||'no match'));
+      it.appendChild(b);return it;
+    },RENDER_CAP));
   }
-
-  const bar=el('div');bar.className='row';bar.style.marginTop='0';
-  const btn=el('button','Download CSV (all '+agg.total+' lines)');
-  btn.onclick=()=>downloadAggCSV(agg);
-  bar.appendChild(btn);
-  OUT.appendChild(bar);
-
-  const g1=el('div');g1.className='group';
-  g1.appendChild(el('h3','Birthday in '+(agg.monthName||'—')+' ('+agg.thisMonth.length+')'));
-  g1.appendChild(renderTable(agg.thisMonth,['Student ID','Name','Birthday','This month','Match'],RENDER_CAP));
-  OUT.appendChild(g1);
-
-  if(agg.matchedOther.length){
-    const g2=el('div');g2.className='group';
-    g2.appendChild(el('h3','Other months ('+agg.matchedOther.length+')'));
-    g2.appendChild(renderTable(agg.matchedOther,['Student ID','Name','Birthday','This month','Match'],RENDER_CAP));
-    OUT.appendChild(g2);
-  }
-
-  if(agg.unmatched.length){
-    const g3=el('div');g3.className='group';
-    g3.appendChild(el('h3','Unmatched ('+agg.unmatched.length+')'));
-    const t=el('table');
-    const th=el('thead'),htr=el('tr');
-    ['Line','Reason'].forEach(c=>htr.appendChild(el('th',c)));
-    th.appendChild(htr);t.appendChild(th);
-    const tb=el('tbody');
-    const shown=agg.unmatched.length>RENDER_CAP?agg.unmatched.slice(0,RENDER_CAP):agg.unmatched;
-    shown.forEach(u=>{
-      const tr=el('tr');
-      tr.appendChild(el('td',u.line));
-      tr.appendChild(el('td',u.error||'no match'));
-      tb.appendChild(tr);
-    });
-    if(agg.unmatched.length>RENDER_CAP){
-      const tr=el('tr');const td=el('td','Showing '+RENDER_CAP+' of '+agg.unmatched.length+'.');
-      td.colSpan=2;td.className='empty';tr.appendChild(td);tb.appendChild(tr);
-    }
-    t.appendChild(tb);g3.appendChild(t);OUT.appendChild(g3);
-  }
+  OUT.appendChild(csvBtn('Download CSV',()=>{
+    const rows=[['Group','Student ID','Name','Birthday','Campus','Program','Match','Score']];
+    const push=(g,e)=>{const s=e.student||{};rows.push([g,s['Student ID']||'',s['Name']||e.line||'',s['Birthday']||'',s['Campus']||'',s['Program']||'',e.matchType||'',e.score||'']);};
+    a.thisMonth.forEach(e=>push('thisMonth',e));a.matchedOther.forEach(e=>push('other',e));
+    a.unmatched.forEach(e=>rows.push(['unmatched','',e.line||'','','','','','']));
+    csvDownload(rows,'birthdays-'+(a.monthName||'month')+'.csv');
+  }));
 }
 
+/* network */
 async function withTimeout(url,opts,ms){
-  const ctrl=new AbortController();
-  const tm=setTimeout(()=>ctrl.abort(),ms);
-  try{return await fetch(url,{...opts,signal:ctrl.signal});}
-  finally{clearTimeout(tm);}
+  const c=new AbortController(),t=setTimeout(()=>c.abort(),ms);
+  try{return await fetch(url,{...opts,signal:c.signal});}finally{clearTimeout(t);}
 }
-
-async function readErr(r){
-  try{const j=await r.json();return j.error||('HTTP '+r.status);}
-  catch(_){return 'HTTP '+r.status;}
-}
+async function readErr(r){try{return (await r.json()).error||('HTTP '+r.status);}catch(_){return 'HTTP '+r.status;}}
+const fail=e=>setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
 
 async function lookupSingle(){
   const q=SINGLE.value.trim();
   if(!q){setStatus('Enter a name or student ID.','bad');return;}
-  setBusy(true);setStatus('Looking up…','load');
+  SINGLE.blur();setBusy(true);setStatus('Searching…','load');
   try{
     const r=await withTimeout('/student?q='+encodeURIComponent(q),{},15000);
-    if(!r.ok){
-      const e=await readErr(r);
-      setStatus('Error: '+e,'bad');
-      return;
-    }
+    if(r.status===404){OUT.innerHTML='';setStatus('No match for “'+q+'”.','bad');return;}
+    if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
     const j=await r.json();
-    if(!j.found){setStatus('No match for "'+q+'".','bad');return;}
-    setStatus('Matched '+j.student['Name']+' · '+j.matchType+' '+j.score+' · '+j.elapsedMs+' ms','ok');
-    renderSingle(j);
-  }catch(e){
-    setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-  }finally{setBusy(false);checkServerStatus();}
+    setStatus(j.elapsedMs+' ms','ok');renderSingle(j);
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
-
 async function scanWorkbook(){
-  setBusy(true);setStatus('Scanning month…','load');
+  setBusy(true);setStatus('Loading…','load');
   try{
     const r=await withTimeout('/birthdays?month='+monthSel(),{},15000);
-    if(!r.ok){
-      const e=await readErr(r);
-      setStatus('Error: '+e,'bad');
-      return;
-    }
-    const j=await r.json();
-    setStatus(j.count+' birthday(s) in '+j.monthName+' · '+j.elapsedMs+' ms','ok');
-    renderWorkbookResult(j);
-  }catch(e){
-    setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-  }finally{setBusy(false);checkServerStatus();}
+    if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
+    const j=await r.json();setStatus(j.elapsedMs+' ms','ok');renderMonth(j);
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
-
 async function scanAll(){
-  setBusy(true);setStatus('Scanning whole file…','load');
+  setBusy(true);setStatus('Loading everyone…','load');
   try{
     const r=await withTimeout('/all',{},30000);
-    if(!r.ok){
-      const e=await readErr(r);
-      setStatus('Error: '+e,'bad');
-      return;
-    }
-    const j=await r.json();
-    setStatus(j.count+' row(s) in '+j.sheet+' · '+j.elapsedMs+' ms','ok');
-    renderAllResult(j);
-  }catch(e){
-    setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-  }finally{setBusy(false);checkServerStatus();}
+    if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
+    const j=await r.json();setStatus(j.elapsedMs+' ms','ok');renderAll(j);
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
-
 async function checkList(){
-  const raw=PASTE.value;
-  const file=document.getElementById('file').files[0];
-  if(!raw.trim()&&!file){setStatus('Paste names or choose a txt file.','bad');return;}
-
-  const month=monthSel();
-  const t0=performance.now();
+  const raw=PASTE.value,file=$('file').files[0];
+  if(!raw.trim()&&!file){setStatus('Paste names or attach a txt file.','bad');return;}
+  const month=monthSel(),t0=performance.now();
   setBusy(true);
 
   if(file){
     setStatus('Uploading…','load');
     try{
-      const fd=new FormData();
-      fd.append('file',file);
-      fd.append('month',String(month));
+      const fd=new FormData();fd.append('file',file);fd.append('month',String(month));
       const r=await withTimeout('/birthdays/list',{method:'POST',body:fd},120000);
-      if(!r.ok){
-        const e=await readErr(r);
-        setStatus('Error: '+e,'bad');
-        return;
-      }
+      if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
       const j=await r.json();
-      j.elapsedMs=Math.round(performance.now()-t0);
-      setStatus(j.thisMonthCount+' classmate(s) have birthday in '+j.monthName+' · '+j.elapsedMs+' ms','ok');
-      renderListResult(j);
-    }catch(e){
-      setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
-    }finally{setBusy(false);checkServerStatus();}
+      setStatus(Math.round(performance.now()-t0)+' ms','ok');renderList(j);
+    }catch(e){fail(e);}finally{setBusy(false);checkServer();}
     return;
   }
 
   const lines=raw.split('\n').map(s=>s.trim()).filter(Boolean);
-  const batches=[];
-  for(let i=0;i<lines.length;i+=BATCH_SIZE) batches.push(lines.slice(i,i+BATCH_SIZE));
-
-  const agg={
-    monthName:null, total:0, rawTotal:0, duplicates:[],
-    thisMonth:[], matchedOther:[], unmatched:[],
-    failedBatches:0, lastError:null
-  };
-
+  const batches=[];for(let i=0;i<lines.length;i+=BATCH_SIZE)batches.push(lines.slice(i,i+BATCH_SIZE));
+  const agg={monthName:null,total:0,duplicates:[],thisMonth:[],matchedOther:[],unmatched:[],failed:0,lastError:null};
   try{
     for(let b=0;b<batches.length;b++){
-      setStatus('Batch '+(b+1)+'/'+batches.length+' ('+batches[b].length+' lines)…','load');
+      setStatus('Batch '+(b+1)+' of '+batches.length+'…','load');
       try{
-        const r=await withTimeout('/birthdays/list',{
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({text:batches[b].join('\n'),month})
-        },60000);
-        if(!r.ok){
-          agg.failedBatches++;
-          if(!agg.lastError) agg.lastError=await readErr(r);
-          continue;
-        }
-        let j;
-        try{ j=await r.json(); }
-        catch(err){ agg.failedBatches++; if(!agg.lastError) agg.lastError='bad JSON from server (HTTP '+r.status+')'; continue; }
-        agg.monthName=j.monthName;
-        agg.rawTotal+=j.rawTotal||0;
-        agg.total+=j.total||0;
-        agg.duplicates.push(...(j.duplicates||[]));
-        agg.thisMonth.push(...(j.thisMonth||[]));
-        agg.matchedOther.push(...(j.matchedOther||[]));
-        agg.unmatched.push(...(j.unmatched||[]));
-      }catch(e){
-        agg.failedBatches++;
-        if(!agg.lastError) agg.lastError=String(e.message||e);
-      }
+        const r=await withTimeout('/birthdays/list',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({text:batches[b].join('\n'),month})},60000);
+        if(!r.ok){agg.failed++;if(!agg.lastError)agg.lastError=await readErr(r);continue;}
+        let j;try{j=await r.json();}catch(_){agg.failed++;if(!agg.lastError)agg.lastError='bad JSON';continue;}
+        agg.monthName=j.monthName;agg.total+=j.total||0;
+        agg.duplicates.push(...(j.duplicates||[]));agg.thisMonth.push(...(j.thisMonth||[]));
+        agg.matchedOther.push(...(j.matchedOther||[]));agg.unmatched.push(...(j.unmatched||[]));
+      }catch(e){agg.failed++;if(!agg.lastError)agg.lastError=String(e.message||e);}
     }
-
     agg.thisMonth.sort((a,b)=>((a.birthdayDay||99)-(b.birthdayDay||99))||String((a.student||{}).Name||'').localeCompare(String((b.student||{}).Name||'')));
     agg.matchedOther.sort((a,b)=>((a.birthdayMonth||99)-(b.birthdayMonth||99))||((a.birthdayDay||99)-(b.birthdayDay||99)));
     agg.matchedCount=agg.thisMonth.length+agg.matchedOther.length;
-    agg.thisMonthCount=agg.thisMonth.length;
-    agg.unmatchedCount=agg.unmatched.length;
-    agg.elapsedMs=Math.round(performance.now()-t0);
-
-    const tag=agg.failedBatches?(' · '+agg.failedBatches+' batch(es) failed: '+(agg.lastError||'')):'';
-    setStatus(agg.thisMonthCount+' classmate(s) have birthday in '+(agg.monthName||'—')+' · '+agg.total+' lines · '+agg.elapsedMs+' ms'+tag,agg.failedBatches?'bad':'ok');
-    renderListResult(agg);
-  }finally{
-    setBusy(false);checkServerStatus();
-  }
+    agg.thisMonthCount=agg.thisMonth.length;agg.unmatchedCount=agg.unmatched.length;
+    setStatus(Math.round(performance.now()-t0)+' ms'+(agg.failed?' · '+agg.failed+' batch(es) failed':''),agg.failed?'bad':'ok');
+    renderList(agg);
+  }finally{setBusy(false);checkServer();}
 }
-
 function clearAll(){
-  PASTE.value='';
-  localStorage.removeItem(LS_PASTE);
-  document.getElementById('file').value='';
-  SINGLE.value='';
-  OUT.innerHTML='<p class="empty">No data loaded.</p>';
-  setStatus('');
+  PASTE.value='';safe(()=>localStorage.removeItem(LS_PASTE));
+  $('file').value='';$('fileLbl').textContent='＋ Attach .txt file';
+  SINGLE.value='';OUT.innerHTML='';setStatus('');
 }
 
+$('singleBtn').onclick=lookupSingle;
+$('scanBtn').onclick=scanWorkbook;
+$('allBtn').onclick=scanAll;
+$('checkBtn').onclick=checkList;
+$('clearBtn').onclick=clearAll;
 SINGLE.addEventListener('keydown',e=>{if(e.key==='Enter')lookupSingle();});
 </script>
 </body>
@@ -1020,6 +918,7 @@ def debug_status():
         "exists": os.path.exists(XLSX_PATH),
         "github_url": GITHUB_RAW or None,
         "sheet_name_setting": SHEET_NAME,
+        "visible_columns": VISIBLE,
         "cwd": os.getcwd(),
         "script_dir": os.path.dirname(os.path.abspath(__file__)),
     }
@@ -1056,6 +955,8 @@ def debug_status():
         idx = get_index()
         out["index_rows"] = len(idx["rows"])
         out["index_sheet"] = idx.get("sheet", SHEET_NAME)
+        if idx["rows"]:
+            out["index_sample"] = row_to_public(idx["rows"][0])
     except Exception as e:
         out["index_error"] = f"{type(e).__name__}: {e}"
     return jsonify(out), 200
@@ -1096,9 +997,10 @@ def birthdays():
         for row in idx["rows"]:
             if row["birthday_month"] != m_num:
                 continue
-            out.append({"Student ID": row["id"], "Name": row["name"],
-                        "Birthday": row["birthday"], "_row": row["row"],
-                        "day": row["birthday_day"]})
+            item = row_to_public(row)
+            item["_row"] = row["row"]
+            item["day"] = row["birthday_day"]
+            out.append(item)
         out.sort(key=lambda x: (x["day"] or 99, x.get("Name", "")))
         return jsonify({"month": m_num, "monthName": m_name, "count": len(out),
                         "rows": out, "elapsedMs": int((time.time() - t0) * 1000)}), 200
@@ -1113,27 +1015,24 @@ def all_rows():
         idx = get_index()
         out = []
         for row in idx["rows"]:
-            out.append({
-                "Student ID": row["id"], "Name": row["name"],
-                "Birthday": row["birthday"],
-                "Month": _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else "",
-                "Day": row["birthday_day"] if row["birthday_day"] is not None else "",
-                "_row": row["row"],
-            })
+            item = row_to_public(row)
+            item["Month"] = _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else ""
+            item["Day"] = row["birthday_day"] if row["birthday_day"] is not None else ""
+            item["_row"] = row["row"]
+            out.append(item)
+
         q = (request.args.get("q") or "").strip().lower()
         if q:
-            out = [r for r in out if (
-                q in str(r["Student ID"]).lower()
-                or q in str(r["Name"]).lower()
-                or q in str(r["Birthday"]).lower()
-                or q in str(r["Month"]).lower()
-            )]
+            fields = VISIBLE + ["Month"]
+            out = [r for r in out if any(q in str(r.get(f, "")).lower() for f in fields)]
+
         m_raw = request.args.get("month")
         if m_raw:
             m_num, m_name = resolve_month(m_raw)
             if m_num is None:
                 return jsonify({"error": "month must be 1-12 or month name"}), 400
             out = [r for r in out if r["Month"] == m_name]
+
         return jsonify({"sheet": idx.get("sheet", SHEET_NAME), "count": len(out),
                         "rows": out, "elapsedMs": int((time.time() - t0) * 1000)}), 200
     except Exception as e:
@@ -1174,7 +1073,6 @@ def birthdays_list():
             lines.append(ln)
 
         idx = get_index()
-
         this_month, matched_other, unmatched = [], [], []
 
         for line in lines:
@@ -1211,7 +1109,8 @@ def birthdays_list():
                 entry.update({
                     "matched": False, "rowNumber": None, "score": None, "matchType": "inline",
                     "student": {"Student ID": "", "Name": name_part or line,
-                                "Birthday": inline_bd.strftime("%B %d, %Y")},
+                                "Birthday": inline_bd.strftime("%B %d, %Y"),
+                                "Campus": "", "Program": ""},
                     "birthdayMonth": inline_bd.month,
                     "birthdayMonthName": _MONTH_NAMES[inline_bd.month],
                     "birthdayDay": inline_bd.day,
@@ -1286,6 +1185,7 @@ def debug_match():
         "winner": None if not win else {
             "index": win["index"], "row": idx["rows"][win["index"]]["row"],
             "name": idx["rows"][win["index"]]["name"],
+            "student": row_to_public(idx["rows"][win["index"]]),
             "score": win["score"], "matchType": win["matchType"]},
         "index_size": len(idx["rows"]),
     }), 200
@@ -1301,7 +1201,8 @@ def healthz():
     try:
         idx = get_index()
         return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH,
-                        "sheet": idx.get("sheet", SHEET_NAME)}), 200
+                        "sheet": idx.get("sheet", SHEET_NAME),
+                        "columns": VISIBLE}), 200
     except FileNotFoundError as e:
         return jsonify({"ok": False, "error": str(e), "path": XLSX_PATH}), 503
     except Exception as e:
@@ -1341,8 +1242,8 @@ if os.path.exists(XLSX_PATH):
     print(f"[startup] workbook {XLSX_PATH} ({_st.st_size} bytes)", file=sys.stderr, flush=True)
     try:
         _idx = get_index()
-        print(f"[startup] indexed {len(_idx['rows'])} rows from sheet '{_idx.get('sheet','?')}'",
-              file=sys.stderr, flush=True)
+        print(f"[startup] indexed {len(_idx['rows'])} rows from sheet '{_idx.get('sheet','?')}', "
+              f"columns visible={VISIBLE}", file=sys.stderr, flush=True)
     except Exception as e:
         print(f"[startup] INDEX FAILED {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         traceback.print_exc(file=sys.stderr)
