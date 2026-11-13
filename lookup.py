@@ -67,7 +67,7 @@ _MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
 
 _MONTH_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
              r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
-             r"Nov(?:ember)?|Dec(?:ember)?")
+             r"Nov(?:ember)?|Dec(?:ember)?)")
 
 
 def fetch_from_github():
@@ -1080,8 +1080,6 @@ def student_single():
             "student": full_student(idx, match["index"]),
             "elapsedMs": int((time.time() - t0) * 1000),
         }), 200
-    except FileNotFoundError as e:
-        return _err("/student", e, t0)
     except Exception as e:
         return _err("/student", e, t0)
 
@@ -1332,7 +1330,6 @@ def refresh():
     return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH}), 200
 
 
-# Startup: fetch if configured, warm index, log clearly
 if GITHUB_RAW:
     _tmp = fetch_from_github()
     if _tmp:
