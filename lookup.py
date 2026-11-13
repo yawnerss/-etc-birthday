@@ -4,17 +4,21 @@ import re
 import threading
 import time
 import unicodedata
+import urllib.request
 from datetime import datetime, date
 from difflib import SequenceMatcher
 
 from flask import Flask, jsonify, request
 from openpyxl import load_workbook
 
+GITHUB_RAW = os.environ.get("XLSX_URL", "").strip()
+
 
 def resolve_xlsx_path():
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.environ.get("XLSX_PATH"),
+        "/tmp/ofes_data.xlsx",
         os.path.join(here, "ofes_data.xlsx"),
         os.path.join(os.getcwd(), "ofes_data.xlsx"),
     ]
@@ -49,6 +53,23 @@ _MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
 _MONTH_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
              r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
              r"Nov(?:ember)?|Dec(?:ember)?")
+
+
+def fetch_from_github():
+    if not GITHUB_RAW:
+        return None
+    url = GITHUB_RAW
+    if "?" not in url:
+        url += "?t=" + str(int(time.time()))
+    tmp = "/tmp/ofes_data.xlsx"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "lookup/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r, open(tmp, "wb") as f:
+            f.write(r.read())
+        return tmp
+    except Exception as e:
+        print(f"github fetch failed: {e}")
+        return None
 
 
 def _try_parse_date(s):
@@ -341,6 +362,20 @@ def match_index(idx, line, min_score=FUZZY_MIN):
     return None
 
 
+def full_student(idx, i):
+    row = idx["rows"][i]
+    m_name = _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else ""
+    return {
+        "Student ID": row["id"],
+        "Name": row["name"],
+        "Birthday": row["birthday"],
+        "Month": m_name,
+        "Day": row["birthday_day"] if row["birthday_day"] is not None else "",
+        "_row": row["row"],
+        "_bday_parsed": bool(row["birthday_month"]),
+    }
+
+
 def student_from_index(idx, i):
     row = idx["rows"][i]
     return {"Student ID": row["id"], "Name": row["name"], "Birthday": row["birthday"]}
@@ -380,7 +415,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:14p
 header h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.01em;}
 .toggle{border:1px solid var(--bd);border-radius:8px;background:var(--panel);color:var(--fg);padding:6px 10px;font:inherit;font-size:13px;cursor:pointer;display:inline-flex;gap:6px;align-items:center;}
 .toggle:hover{border-color:var(--muted);}
-main{max-width:1100px;margin:0 auto;padding:20px;}
+main{max-width:1200px;margin:0 auto;padding:20px;}
 section{margin-bottom:24px;}
 h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 10px;}
 .field{display:flex;flex-direction:column;gap:4px;}
@@ -410,6 +445,9 @@ tr:last-child td{border-bottom:none;}
 .chip.on{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok);}
 .empty{color:var(--muted);font-style:italic;}
 .group h3{font-size:12px;font-weight:600;color:var(--muted);margin:16px 0 6px;text-transform:uppercase;letter-spacing:.06em;}
+.card{border:1px solid var(--bd);border-radius:10px;background:var(--panel);padding:16px;}
+.card .kv{display:grid;grid-template-columns:140px 1fr;gap:6px 12px;font-size:13px;}
+.card .kv .k{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em;}
 </style>
 </head>
 <body>
@@ -419,11 +457,24 @@ tr:last-child td{border-bottom:none;}
 </header>
 <main>
 <section>
+  <h2>Single student lookup</h2>
+  <div class="grid">
+    <div class="field">
+      <label for="single">Name or Student ID</label>
+      <input id="single" placeholder="IGARTA ALVIN · ALVIN IGARTA · 26-05959" autocomplete="off">
+    </div>
+  </div>
+  <div class="row"><button class="primary" id="singleBtn" onclick="lookupSingle()">Look up</button></div>
+</section>
+<section>
   <h2>Scan workbook</h2>
   <div class="grid">
     <div class="field"><label for="month">Month</label><select id="month"></select></div>
   </div>
-  <div class="row"><button class="primary" id="scanBtn" onclick="scanWorkbook()">Scan</button></div>
+  <div class="row">
+    <button class="primary" id="scanBtn" onclick="scanWorkbook()">Scan month</button>
+    <button class="primary" id="allBtn" onclick="scanAll()">Scan whole file</button>
+  </div>
 </section>
 <section>
   <h2>Classmate list</h2>
@@ -447,12 +498,12 @@ tr:last-child td{border-bottom:none;}
 const STATUS=document.getElementById('status');
 const OUT=document.getElementById('out');
 const PASTE=document.getElementById('paste');
+const SINGLE=document.getElementById('single');
 const MONTHS=["","January","February","March","April","May","June","July","August","September","October","November","December"];
 
 const BATCH_SIZE=400;
 const RENDER_CAP=300;
 const LS_PASTE='bday-paste';
-let LAST_AGG=null;
 
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme',t);
@@ -500,6 +551,8 @@ function monthSel(){return parseInt(document.getElementById('month').value,10);}
 function setBusy(b){
   document.getElementById('checkBtn').disabled=b;
   document.getElementById('scanBtn').disabled=b;
+  document.getElementById('allBtn').disabled=b;
+  document.getElementById('singleBtn').disabled=b;
 }
 
 function renderTable(rows,cols,cap){
@@ -543,6 +596,48 @@ function renderTable(rows,cols,cap){
   t.appendChild(tb);return t;
 }
 
+function csvDownload(rows,name){
+  const csv=rows.map(r=>r.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\n');
+  const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=name;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+
+function renderSingle(data){
+  OUT.innerHTML='';
+  const s=el('div');s.className='summary';
+  s.innerHTML='<span>matched <b>'+data.matchType+'</b> · score <b>'+data.score+'</b></span>'+
+    '<span>row <b>'+data.student._row+'</b></span>'+
+    '<span>query <b>'+data.query+'</b></span>';
+  OUT.appendChild(s);
+
+  const card=el('div');card.className='card';
+  const kv=el('div');kv.className='kv';
+  const rows=[
+    ['Student ID', data.student['Student ID']],
+    ['Name', data.student['Name']],
+    ['Birthday', data.student['Birthday']],
+    ['Month', data.student['Month']],
+    ['Day', data.student['Day']],
+    ['Row', data.student._row],
+  ];
+  rows.forEach(([k,v])=>{
+    kv.appendChild(el('div',k)).className='k';
+    kv.appendChild(el('div',v===''||v==null?'—':String(v)));
+  });
+  card.appendChild(kv);
+  OUT.appendChild(card);
+
+  const bar=el('div');bar.className='row';
+  const btn=el('button','Copy JSON');
+  btn.onclick=()=>navigator.clipboard.writeText(JSON.stringify(data.student,null,2));
+  bar.appendChild(btn);
+  OUT.appendChild(bar);
+}
+
 function renderWorkbookResult(data){
   OUT.innerHTML='';
   const s=el('div');s.className='summary';
@@ -552,7 +647,54 @@ function renderWorkbookResult(data){
   OUT.appendChild(renderTable(data.rows,['Student ID','Name','Birthday'],RENDER_CAP));
 }
 
-function downloadCSV(agg){
+function renderAllResult(data){
+  OUT.innerHTML='';
+  const s=el('div');s.className='summary';
+  s.innerHTML='<span><b>'+data.count+'</b> total row(s)</span>'+
+    '<span>sheet <b>'+data.sheet+'</b></span>'+
+    (data.elapsedMs!==undefined?'<span>'+data.elapsedMs+' ms</span>':'');
+  OUT.appendChild(s);
+
+  const bar=el('div');bar.className='row';bar.style.marginTop='0';
+  const btn=el('button','Download CSV ('+data.count+' rows)');
+  btn.onclick=()=>{
+    const rows=[['Student ID','Name','Birthday','Month','Day']];
+    data.rows.forEach(r=>rows.push([r['Student ID'],r['Name'],r['Birthday'],r['Month'],r['Day']]));
+    csvDownload(rows,'ofes-all.csv');
+  };
+  bar.appendChild(btn);
+  OUT.appendChild(bar);
+
+  const bar2=el('div');bar2.className='row';bar2.style.marginTop='8px';
+  const filt=el('input');
+  filt.placeholder='Filter by name / ID / month…';
+  filt.style.maxWidth='340px';
+  bar2.appendChild(filt);
+  OUT.appendChild(bar2);
+
+  const holder=el('div');
+  OUT.appendChild(holder);
+
+  const draw=(q)=>{
+    const qq=(q||'').trim().toLowerCase();
+    const filtered=qq
+      ? data.rows.filter(r=>
+          String(r['Student ID']).toLowerCase().includes(qq)||
+          String(r['Name']).toLowerCase().includes(qq)||
+          String(r['Month']).toLowerCase().includes(qq)||
+          String(r['Birthday']).toLowerCase().includes(qq))
+      : data.rows;
+    holder.innerHTML='';
+    const sub=el('div');sub.className='summary';
+    sub.innerHTML='<span>showing <b>'+Math.min(filtered.length,RENDER_CAP)+'</b> of <b>'+filtered.length+'</b></span>';
+    holder.appendChild(sub);
+    holder.appendChild(renderTable(filtered,['Student ID','Name','Birthday','Month','Day'],RENDER_CAP));
+  };
+  filt.addEventListener('input',()=>draw(filt.value));
+  draw('');
+}
+
+function downloadAggCSV(agg){
   if(!agg) return;
   const rows=[['Group','Student ID','Name','Birthday','MatchType','Score']];
   const push=(g,e)=>{
@@ -562,17 +704,10 @@ function downloadCSV(agg){
   agg.thisMonth.forEach(e=>push('thisMonth',e));
   agg.matchedOther.forEach(e=>push('other',e));
   agg.unmatched.forEach(e=>rows.push(['unmatched','',''+(e.line||''),'','','']));
-  const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
-  const blob=new Blob([csv],{type:'text/csv;charset=utf-8'});
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
-  a.download='birthdays-'+agg.monthName+'.csv';
-  a.click();
-  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  csvDownload(rows,'birthdays-'+agg.monthName+'.csv');
 }
 
 function renderListResult(agg){
-  LAST_AGG=agg;
   OUT.innerHTML='';
   const s=el('div');s.className='summary';
   s.innerHTML='<span><b>'+agg.total+'</b> unique lines</span>'+
@@ -586,7 +721,7 @@ function renderListResult(agg){
 
   const bar=el('div');bar.className='row';bar.style.marginTop='0';
   const btn=el('button','Download CSV (all '+agg.total+' lines)');
-  btn.onclick=()=>downloadCSV(agg);
+  btn.onclick=()=>downloadAggCSV(agg);
   bar.appendChild(btn);
   OUT.appendChild(bar);
 
@@ -632,14 +767,43 @@ async function withTimeout(url,opts,ms){
   finally{clearTimeout(tm);}
 }
 
+async function lookupSingle(){
+  const q=SINGLE.value.trim();
+  if(!q){setStatus('Enter a name or student ID.','bad');return;}
+  setBusy(true);setStatus('Looking up…','load');
+  try{
+    const r=await withTimeout('/student?q='+encodeURIComponent(q),{},15000);
+    const j=await r.json();
+    if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
+    if(!j.found){setStatus('No match for "'+q+'".','bad');return;}
+    setStatus('Matched '+j.student['Name']+' · '+j.matchType+' '+j.score+' · '+j.elapsedMs+' ms','ok');
+    renderSingle(j);
+  }catch(e){
+    setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
+  }finally{setBusy(false);}
+}
+
 async function scanWorkbook(){
-  setBusy(true);setStatus('Scanning…','load');
+  setBusy(true);setStatus('Scanning month…','load');
   try{
     const r=await withTimeout('/birthdays?month='+monthSel(),{},15000);
     const j=await r.json();
     if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
     setStatus(j.count+' birthday(s) in '+j.monthName+' · '+j.elapsedMs+' ms','ok');
     renderWorkbookResult(j);
+  }catch(e){
+    setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
+  }finally{setBusy(false);}
+}
+
+async function scanAll(){
+  setBusy(true);setStatus('Scanning whole file…','load');
+  try{
+    const r=await withTimeout('/all',{},30000);
+    const j=await r.json();
+    if(!r.ok){setStatus(j.error||('Error '+r.status),'bad');return;}
+    setStatus(j.count+' row(s) in '+j.sheet+' · '+j.elapsedMs+' ms','ok');
+    renderAllResult(j);
   }catch(e){
     setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
   }finally{setBusy(false);}
@@ -725,10 +889,12 @@ function clearAll(){
   PASTE.value='';
   localStorage.removeItem(LS_PASTE);
   document.getElementById('file').value='';
-  LAST_AGG=null;
+  SINGLE.value='';
   OUT.innerHTML='<p class="empty">No data loaded.</p>';
   setStatus('');
 }
+
+SINGLE.addEventListener('keydown',e=>{if(e.key==='Enter')lookupSingle();});
 </script>
 </body>
 </html>
@@ -738,6 +904,34 @@ function clearAll(){
 @app.get("/")
 def index():
     return INDEX_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.get("/student")
+def student_single():
+    t0 = time.time()
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "q required"}), 400
+    try:
+        idx = get_index()
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 500
+
+    match = match_index(idx, q)
+    if match is None:
+        return jsonify({
+            "found": False, "query": q,
+            "elapsedMs": int((time.time() - t0) * 1000),
+        }), 404
+
+    return jsonify({
+        "found": True,
+        "query": q,
+        "matchType": match["matchType"],
+        "score": round(match["score"], 3),
+        "student": full_student(idx, match["index"]),
+        "elapsedMs": int((time.time() - t0) * 1000),
+    }), 200
 
 
 @app.get("/birthdays")
@@ -759,6 +953,59 @@ def birthdays():
     out.sort(key=lambda x: (x["day"] or 99, x.get("Name", "")))
     return jsonify({"month": m_num, "monthName": m_name, "count": len(out), "rows": out,
                     "elapsedMs": int((time.time() - t0) * 1000)}), 200
+
+
+@app.get("/all")
+def all_rows():
+    t0 = time.time()
+    try:
+        idx = get_index()
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 500
+
+    out = []
+    for row in idx["rows"]:
+        out.append({
+            "Student ID": row["id"],
+            "Name": row["name"],
+            "Birthday": row["birthday"],
+            "Month": _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else "",
+            "Day": row["birthday_day"] if row["birthday_day"] is not None else "",
+            "_row": row["row"],
+        })
+
+    q = (request.args.get("q") or "").strip().lower()
+    if q:
+        out = [r for r in out if (
+            q in str(r["Student ID"]).lower()
+            or q in str(r["Name"]).lower()
+            or q in str(r["Birthday"]).lower()
+            or q in str(r["Month"]).lower()
+        )]
+
+    m_raw = request.args.get("month")
+    if m_raw:
+        m_num, m_name = resolve_month(m_raw)
+        if m_num is None:
+            return jsonify({"error": "month must be 1-12 or month name"}), 400
+        out = [r for r in out if r["Month"] == m_name]
+
+    sheet = SHEET_NAME
+    try:
+        wb = load_workbook(XLSX_PATH, read_only=True)
+        try:
+            sheet = SHEET_NAME if SHEET_NAME in wb.sheetnames else wb.sheetnames[0]
+        finally:
+            wb.close()
+    except Exception:
+        pass
+
+    return jsonify({
+        "sheet": sheet,
+        "count": len(out),
+        "rows": out,
+        "elapsedMs": int((time.time() - t0) * 1000),
+    }), 200
 
 
 @app.post("/birthdays/list")
@@ -933,6 +1180,31 @@ def healthz():
     except FileNotFoundError as e:
         return jsonify({"ok": False, "error": str(e), "path": XLSX_PATH}), 503
 
+
+@app.get("/refresh")
+@app.post("/refresh")
+def refresh():
+    global XLSX_PATH, _INDEX
+    if not GITHUB_RAW:
+        return jsonify({"error": "XLSX_URL env var not set"}), 400
+    tmp = fetch_from_github()
+    if not tmp:
+        return jsonify({"error": "fetch failed"}), 502
+    with _load_lock:
+        XLSX_PATH = tmp
+        _INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {},
+                  "by_prefix": {}, "by_sorted": {}}
+    try:
+        idx = get_index()
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH}), 200
+
+
+if GITHUB_RAW:
+    _tmp = fetch_from_github()
+    if _tmp:
+        XLSX_PATH = _tmp
 
 if os.path.exists(XLSX_PATH):
     try:
