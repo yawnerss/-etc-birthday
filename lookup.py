@@ -10,28 +10,13 @@ from difflib import SequenceMatcher
 from flask import Flask, jsonify, request
 from openpyxl import load_workbook
 
-
-def resolve_xlsx_path():
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.environ.get("XLSX_PATH"),
-        "/etc/secrets/ofes_data.xlsx",
-        os.path.join(here, "ofes_data.xlsx"),
-        os.path.join(os.getcwd(), "ofes_data.xlsx"),
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    return os.path.join(here, "ofes_data.xlsx")
-
-
-XLSX_PATH = resolve_xlsx_path()
+XLSX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ofes_data.xlsx")
 SHEET_NAME = "Sheet1"
 FUZZY_MIN = 0.72
 
 app = Flask(__name__)
 _load_lock = threading.Lock()
-_INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}, "by_sorted": {}}
+_INDEX = {"key": None, "rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}}
 
 _BDAY_FORMATS = [
     "%B %d, %Y", "%b %d, %Y",
@@ -48,7 +33,7 @@ _MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
 
 _MONTH_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
              r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
-             r"Nov(?:ember)?|Dec(?:ember)?")
+             r"Nov(?:ember)?|Dec(?:ember)?)")
 
 
 def _try_parse_date(s):
@@ -202,7 +187,7 @@ def _load_index():
         it = ws.iter_rows(values_only=True)
         header_row = next(it, None)
         if header_row is None:
-            return {"rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}, "by_sorted": {}}
+            return {"rows": [], "by_id": {}, "by_token": {}, "by_prefix": {}}
 
         headers = {}
         for idx, name in enumerate(header_row):
@@ -254,15 +239,7 @@ def _load_index():
                 if len(t) >= 3:
                     by_prefix.setdefault(t[:3], set()).add(i)
 
-        by_sorted = {}
-        for i, r in enumerate(rows):
-            if not r["name_tokens"]:
-                continue
-            key = tuple(sorted(r["name_tokens"]))
-            by_sorted.setdefault(key, []).append(i)
-
-        return {"rows": rows, "by_id": by_id, "by_token": by_token,
-                "by_prefix": by_prefix, "by_sorted": by_sorted}
+        return {"rows": rows, "by_id": by_id, "by_token": by_token, "by_prefix": by_prefix}
     finally:
         wb.close()
 
@@ -296,14 +273,12 @@ def match_index(idx, line, min_score=FUZZY_MIN):
     by_id = idx["by_id"]
     by_token = idx["by_token"]
     by_prefix = idx["by_prefix"]
-    by_sorted = idx["by_sorted"]
     rows = idx["rows"]
 
     for form in forms:
         fk = re.sub(r"\s+", " ", _fold(form)).strip()
         if fk in by_id:
             return {"index": by_id[fk], "score": 1.0, "matchType": "id"}
-
     for form in forms:
         for tok in re.split(r"[,\s;]+", form):
             if not tok:
@@ -311,14 +286,6 @@ def match_index(idx, line, min_score=FUZZY_MIN):
             tk = re.sub(r"\s+", " ", _fold(tok)).strip()
             if tk in by_id:
                 return {"index": by_id[tk], "score": 1.0, "matchType": "id-token"}
-
-    for form in forms:
-        qtok = tuple(sorted(_tokens(form)))
-        if not qtok:
-            continue
-        hit = by_sorted.get(qtok)
-        if hit:
-            return {"index": hit[0], "score": 0.99, "matchType": "tokens"}
 
     best = None
     for form in forms:
@@ -392,7 +359,6 @@ textarea{min-height:140px;font-family:ui-monospace,SFMono-Regular,Menlo,monospac
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;}
 button{padding:8px 14px;border:1px solid var(--bd);border-radius:8px;background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer;}
 button.primary{background:var(--ac);border-color:var(--ac);color:var(--ac-fg);}
-button:hover{filter:brightness(1.04);}
 button:disabled{opacity:.5;cursor:not-allowed;}
 #status{min-height:18px;font-size:13px;color:var(--muted);margin-bottom:10px;}
 #status.ok{color:var(--ok);}
@@ -711,7 +677,7 @@ def birthdays_list():
             bd = parse_birthday(student["Birthday"]) or inline_bd
             entry.update({
                 "matched": True,
-                "rowNumber": idx["rows"][match["index"]]["row"],
+                "rowNumber": student and idx["rows"][match["index"]]["row"],
                 "score": round(match["score"], 3),
                 "matchType": match["matchType"],
                 "student": student,
@@ -765,71 +731,10 @@ def birthdays_list():
     }), 200
 
 
-@app.get("/debug/match")
-def debug_match():
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify({"error": "q required"}), 400
-    try:
-        idx = get_index()
-    except FileNotFoundError as e:
-        return jsonify({"error": str(e)}), 500
-
-    forms = parse_line_forms(q)
-    by_token = idx["by_token"]
-    by_prefix = idx["by_prefix"]
-    by_sorted = idx["by_sorted"]
-
-    detail = []
-    for form in forms:
-        ftok = _tokens(form)
-        ftok_sorted = tuple(sorted(ftok))
-        cands = set()
-        for t in set(ftok):
-            cands.update(by_token.get(t, ()))
-            if len(t) >= 3:
-                cands.update(by_prefix.get(t[:3], ()))
-        scored = []
-        for i in list(cands)[:20]:
-            sc, mt = name_match_score(form, idx["rows"][i]["name"])
-            scored.append({"index": i, "row": idx["rows"][i]["row"],
-                           "name": idx["rows"][i]["name"],
-                           "score": round(sc, 3), "matchType": mt})
-        scored.sort(key=lambda x: -x["score"])
-        detail.append({
-            "form": form,
-            "tokens": ftok,
-            "sorted_key_hit": bool(by_sorted.get(ftok_sorted)),
-            "top_candidates": scored[:5],
-        })
-
-    win = match_index(idx, q)
-    return jsonify({
-        "query": q,
-        "forms": detail,
-        "winner": None if not win else {
-            "index": win["index"], "row": idx["rows"][win["index"]]["row"],
-            "name": idx["rows"][win["index"]]["name"],
-            "score": win["score"], "matchType": win["matchType"],
-        },
-        "index_size": len(idx["rows"]),
-    }), 200
-
-
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
 
 
-@app.get("/healthz")
-def healthz():
-    try:
-        idx = get_index()
-        return jsonify({"ok": True, "rows": len(idx["rows"]), "path": XLSX_PATH}), 200
-    except FileNotFoundError as e:
-        return jsonify({"ok": False, "error": str(e), "path": XLSX_PATH}), 503
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="127.0.0.1", port=5000, debug=False)
