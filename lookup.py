@@ -297,6 +297,16 @@ def _cell_to_str(v):
     return str(v)
 
 
+def _batch_from_id(sid):
+    """Batch = the year prefix of the student ID: '26-05959' -> '26', '2024-001' -> '24'."""
+    sid = (sid or "").strip()
+    m = re.match(r"^(20\d{2})\D", sid)
+    if m:
+        return m.group(1)[2:]
+    m = re.match(r"^(\d{2})\D", sid)
+    return m.group(1) if m else ""
+
+
 def _load_index():
     if not os.path.exists(XLSX_PATH):
         raise FileNotFoundError(f"missing workbook: {XLSX_PATH}")
@@ -365,6 +375,7 @@ def _load_index():
                 "birthday_year": (bd_parsed.year if bd_parsed and bd_parsed.year != 1900 else None),
                 "name_tokens": tuple(name_tokens),
                 "id_folded": id_folded,
+                "batch": _batch_from_id(sid_s),
             })
             if id_folded:
                 by_id[id_folded] = i
@@ -520,6 +531,7 @@ def row_to_public(row, today=None):
         "Birthday": row["birthday"],
         "Campus": row["campus"],
         "Program": row["program"],
+        "Batch": row.get("batch", ""),
         "Age": d["Age"],
         "Zodiac": d["Zodiac"],
         "DaysToBday": d["DaysToBday"],
@@ -717,8 +729,8 @@ select option{background:#111;color:#ddd;}
 /* nav */
 nav{position:fixed;left:0;right:0;bottom:0;z-index:30;padding-bottom:env(safe-area-inset-bottom);
   background:linear-gradient(transparent,var(--bg) 40%);}
-nav .in{display:grid;grid-template-columns:repeat(4,1fr);max-width:620px;margin:0 auto;}
-nav button{height:62px;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12px;letter-spacing:.08em;
+nav .in{display:grid;grid-template-columns:repeat(5,1fr);max-width:620px;margin:0 auto;}
+nav button{height:62px;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11.5px;letter-spacing:.05em;
   cursor:pointer;position:relative;transition:color .25s;}
 nav button::before{content:"";position:absolute;left:50%;top:10px;width:0;height:2px;background:var(--g);border-radius:2px;
   transform:translateX(-50%);transition:width .25s;box-shadow:0 0 8px var(--g);}
@@ -771,6 +783,16 @@ nav button.on::before{width:18px;}
     </div>
   </section>
 
+  <section class="panel" id="p-browse">
+    <h1 class="lead">browse</h1>
+    <p class="sub">students by program and <b>batch</b> (the year in the ID: 21, 22, 23... 26)</p>
+    <div class="stack">
+      <select id="prog" aria-label="Program"><option value="">all programs</option></select>
+      <select id="batch" aria-label="Batch"><option value="">all batches</option></select>
+      <button class="btn primary" id="browseBtn">list students</button>
+    </div>
+  </section>
+
   <section class="panel" id="p-intel">
     <h1 class="lead">intel</h1>
     <p class="sub">today, incoming birthdays, students per campus</p>
@@ -794,6 +816,7 @@ nav button.on::before{width:18px;}
   <button data-tab="find" class="on">find</button>
   <button data-tab="month">month</button>
   <button data-tab="list">list</button>
+  <button data-tab="browse">browse</button>
   <button data-tab="intel">intel</button>
 </div></nav>
 
@@ -822,12 +845,13 @@ $('theme').onclick=()=>{
 };
 
 /* tabs */
-let STATS_LOADED=false;
+let STATS_LOADED=false,PROG=null;
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.id==='p-'+b.dataset.tab));
   window.scrollTo({top:0,behavior:'smooth'});
   if(b.dataset.tab==='intel'&&!STATS_LOADED)loadStats();
+  if(b.dataset.tab==='browse'&&!PROG)loadPrograms();
 });
 
 /* month select */
@@ -860,7 +884,7 @@ async function checkServer(){
 checkServer();
 
 function setStatus(m,k){STATUS.textContent=m||'';STATUS.className=k||'';}
-function setBusy(b){['checkBtn','scanBtn','allBtn','singleBtn','statsBtn'].forEach(id=>$(id).disabled=b);}
+function setBusy(b){['checkBtn','scanBtn','allBtn','singleBtn','statsBtn','browseBtn'].forEach(id=>$(id).disabled=b);}
 
 /* subtle scan effect: thin progress line + one rotating log line */
 const SCAN_LOGS={
@@ -893,7 +917,7 @@ async function runScan(kind,work){
 /* components */
 function meta(s){
   const a=[s['Student ID'],s['Birthday']].filter(Boolean).join('  /  ');
-  const b=[s['Campus'],s['Program']].filter(Boolean).join('  /  ');
+  const b=[s['Campus'],s['Program'],s['Batch']?'batch '+s['Batch']:''].filter(Boolean).join('  /  ');
   return [a,b];
 }
 function item(s,opts){
@@ -991,7 +1015,7 @@ function renderAll(d){
   const f=el('input');f.placeholder='filter by name, id, campus, month, age';f.setAttribute('autocapitalize','off');
   OUT.appendChild(f);
   const holder=el('div');holder.style.marginTop='10px';OUT.appendChild(holder);
-  const cols=['Student ID','Name','Birthday','Age','Campus','Program','Month','Day'];
+  const cols=['Student ID','Name','Birthday','Age','Campus','Program','Batch','Month','Day'];
   const draw=q=>{
     q=(q||'').trim().toLowerCase();
     const rows=q?d.rows.filter(r=>cols.some(c=>String(r[c]).toLowerCase().includes(q))):d.rows;
@@ -1109,6 +1133,69 @@ async function loadCampus(name){
     window.scrollTo({top:0,behavior:'smooth'});
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
+/* browse by program + batch */
+function addOpt(sel,v,t){const o=document.createElement('option');o.value=v;o.textContent=t;sel.appendChild(o);}
+function fillProgramSelects(){
+  const ps=$('prog'),curP=ps.value;
+  ps.innerHTML='';addOpt(ps,'','all programs ('+PROG.total+')');
+  PROG.programs.forEach(p=>addOpt(ps,p.program,p.program+' ('+p.count+')'));
+  if([...ps.options].some(o=>o.value===curP))ps.value=curP;
+  fillBatches();
+}
+function fillBatches(){
+  const bs=$('batch'),cur=bs.value,p=$('prog').value;
+  const pg=p?PROG.programs.find(x=>x.program===p):null;
+  const list=pg?pg.batches:PROG.batches;
+  bs.innerHTML='';addOpt(bs,'','all batches');
+  list.forEach(([b,c])=>addOpt(bs,b,(b==='?'?'no batch':'batch '+b)+' ('+c+')'));
+  if([...bs.options].some(o=>o.value===cur))bs.value=cur;
+}
+function pickBatch(label){
+  const b=label==='no batch'?'?':label.replace('batch ','');
+  $('batch').value=b;runBrowse();
+}
+function pickProgram(name){$('prog').value=name;fillBatches();runBrowse();}
+const batchPairs=list=>list.map(([b,c])=>[b==='?'?'no batch':'batch '+b,c]);
+function renderPrograms(){
+  OUT.innerHTML='';
+  OUT.appendChild(sum(['<b>'+PROG.programs.length+'</b> programs','<b>'+PROG.batches.length+'</b> batches','<b>'+PROG.total+'</b> students']));
+  OUT.appendChild(h3('students per program',PROG.programs.length));
+  OUT.appendChild(bars(PROG.programs.map(p=>[p.program,p.count]),pickProgram,true));
+  OUT.appendChild(h3('students per batch',PROG.batches.length));
+  OUT.appendChild(bars(batchPairs(PROG.batches),pickBatch));
+  OUT.appendChild(el('div','hint','tap a program or batch to list students'));
+}
+async function loadPrograms(){
+  setBusy(true);
+  try{
+    const r=await runScan('stats',()=>withTimeout('/programs',{},20000));
+    if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
+    PROG=await r.json();fillProgramSelects();
+    setStatus('[+] '+PROG.programs.length+' programs, '+PROG.batches.length+' batches','ok');
+    renderPrograms();
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
+}
+async function runBrowse(){
+  if(!PROG){loadPrograms();return;}
+  const p=$('prog').value,b=$('batch').value;
+  if(!p&&!b){setStatus('[+] overview','ok');renderPrograms();return;}
+  const qs=[];if(p)qs.push('program='+encodeURIComponent(p));if(b)qs.push('batch='+encodeURIComponent(b));
+  setBusy(true);
+  try{
+    const r=await runScan('all',()=>withTimeout('/all?'+qs.join('&'),{},30000));
+    if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
+    const j=await r.json();
+    setStatus('[+] '+j.count+' student'+(j.count===1?'':'s')+(p?' in '+p:'')+(b?(b==='?'?' with no batch':' from batch '+b):''),'ok');
+    renderAll(j);
+    const pg=p?PROG.programs.find(x=>x.program===p):null;
+    if(pg){
+      const first=OUT.firstChild;
+      OUT.insertBefore(h3('batches in '+p,pg.batches.length),first);
+      OUT.insertBefore(bars(batchPairs(pg.batches),pickBatch),first);
+    }
+    window.scrollTo({top:0,behavior:'smooth'});
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
+}
 async function batchCheck(raw,month){
   const lines=raw.split('\n').map(s=>s.trim()).filter(Boolean);
   const batches=[];for(let i=0;i<lines.length;i+=BATCH_SIZE)batches.push(lines.slice(i,i+BATCH_SIZE));
@@ -1163,6 +1250,9 @@ $('allBtn').onclick=scanAll;
 $('checkBtn').onclick=checkList;
 $('clearBtn').onclick=clearAll;
 $('statsBtn').onclick=loadStats;
+$('browseBtn').onclick=runBrowse;
+$('prog').onchange=()=>{fillBatches();runBrowse();};
+$('batch').onchange=runBrowse;
 $('days').onchange=()=>{if(STATS_LOADED)loadStats();};
 SINGLE.addEventListener('keydown',e=>{if(e.key==='Enter')lookupSingle();});
 </script>
@@ -1327,12 +1417,25 @@ def all_rows():
 
         q = (request.args.get("q") or "").strip().lower()
         if q:
-            fields = VISIBLE + ["Month", "Age"]
+            fields = VISIBLE + ["Month", "Age", "Batch"]
             out = [r for r in out if any(q in str(r.get(f, "")).lower() for f in fields)]
 
         c_raw = (request.args.get("campus") or "").strip().lower()
         if c_raw:
             out = [r for r in out if r["Campus"].strip().lower() == c_raw]
+
+        p_raw = (request.args.get("program") or "").strip().lower()
+        if p_raw:
+            want_p = "" if p_raw == "(no program)" else p_raw
+            out = [r for r in out if r["Program"].strip().lower() == want_p]
+
+        b_raw = (request.args.get("batch") or "").strip()
+        if b_raw:
+            want_b = "" if b_raw == "?" else b_raw
+            out = [r for r in out if str(r["Batch"]) == want_b]
+
+        if c_raw or p_raw or b_raw:
+            out.sort(key=lambda r: r["Name"].lower())
 
         m_raw = request.args.get("month")
         if m_raw:
@@ -1345,6 +1448,35 @@ def all_rows():
                         "rows": out, "elapsedMs": int((time.time() - t0) * 1000)}), 200
     except Exception as e:
         return _err("/all", e, t0)
+
+
+@app.get("/programs")
+def programs():
+    """Programs with student counts and a per-batch breakdown, plus overall batch counts."""
+    t0 = time.time()
+    try:
+        idx = get_index()
+        per, overall = {}, Counter()
+        for row in idx["rows"]:
+            p = row["program"].strip() or "(no program)"
+            b = row.get("batch") or "?"
+            per.setdefault(p, Counter())[b] += 1
+            overall[b] += 1
+
+        def bkey(kv):
+            return (kv[0] == "?", kv[0])
+
+        progs = [{"program": p, "count": sum(c.values()), "batches": sorted(c.items(), key=bkey)}
+                 for p, c in per.items()]
+        progs.sort(key=lambda x: (-x["count"], x["program"]))
+        return jsonify({
+            "total": len(idx["rows"]),
+            "programs": progs,
+            "batches": sorted(overall.items(), key=bkey),
+            "elapsedMs": int((time.time() - t0) * 1000),
+        }), 200
+    except Exception as e:
+        return _err("/programs", e, t0)
 
 
 @app.get("/stats")
