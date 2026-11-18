@@ -656,14 +656,33 @@ select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/
   background-repeat:no-repeat;background-position:right 2px center;padding-right:24px;}
 select option{background:#111;color:#ddd;}
 .stack{display:flex;flex-direction:column;gap:14px;}
-.ac{position:relative;}
-.sug{display:none;position:absolute;left:0;right:0;top:100%;z-index:25;max-height:270px;overflow:auto;
-  background:#0f1110;border:1px solid var(--line);border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.6);margin-top:4px;}
-.sug.on{display:block;animation:rise .18s ease;}
-.sug div{display:flex;justify-content:space-between;gap:14px;padding:12px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--line);}
-.sug div:last-child{border-bottom:0;}
-.sug div:hover,.sug div:active{background:var(--soft);color:var(--g);}
-.sug small{color:var(--muted);flex:none;font-size:11px;}
+.pick{position:relative;display:flex;flex-direction:column;gap:3px;padding:13px 44px 13px 16px;border:1px solid var(--line);
+  border-radius:14px;background:var(--soft);cursor:pointer;transition:border-color .2s,background .2s;outline:none;}
+.pick:hover,.pick:focus-visible{border-color:color-mix(in srgb,var(--g) 55%,transparent);}
+.pick::after{content:"";position:absolute;right:18px;top:50%;width:7px;height:7px;border-right:1.5px solid var(--muted);
+  border-bottom:1.5px solid var(--muted);transform:translateY(-70%) rotate(45deg);}
+.pick .lbl{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);}
+.pick .val{font-size:15px;line-height:1.4;overflow-wrap:anywhere;color:var(--fg);}
+.pick.set{border-color:color-mix(in srgb,var(--g) 40%,transparent);}
+.pick.set .val{color:var(--g);}
+#sheet{position:fixed;inset:0;z-index:80;display:none;}
+#sheet.on{display:block;}
+.sheet-bg{position:absolute;inset:0;background:rgba(0,0,0,.62);backdrop-filter:blur(3px);animation:fadein .2s;}
+@keyframes fadein{from{opacity:0;}to{opacity:1;}}
+.sheet-panel{position:absolute;left:50%;bottom:0;transform:translateX(-50%);width:100%;max-width:620px;max-height:84vh;
+  display:flex;flex-direction:column;background:#0e100f;border:1px solid var(--line);border-bottom:0;border-radius:22px 22px 0 0;
+  animation:up .28s cubic-bezier(.2,.7,.2,1);}
+@keyframes up{from{transform:translate(-50%,40px);opacity:0;}to{transform:translate(-50%,0);opacity:1;}}
+.sheet-head{padding:20px 22px 6px;flex:none;}
+.sheet-title{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:6px;}
+.sheet-head input{height:46px;font-size:16px;}
+.sheet-list{overflow:auto;padding:4px 0 calc(14px + env(safe-area-inset-bottom));-webkit-overflow-scrolling:touch;}
+.opt{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:14px 22px;cursor:pointer;
+  border-bottom:1px solid var(--line);font-size:14px;line-height:1.4;transition:background .15s;}
+.opt span{overflow-wrap:anywhere;}
+.opt small{flex:none;color:var(--muted);font-size:12px;padding-top:2px;font-variant-numeric:tabular-nums;}
+.opt:hover,.opt:active{background:var(--soft);}
+.opt.sel{color:var(--g);}
 .btn{
   height:46px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--fg);
   font:inherit;font-size:13px;font-weight:600;letter-spacing:.04em;cursor:pointer;padding:0 22px;width:100%;
@@ -727,7 +746,11 @@ select option{background:#111;color:#ddd;}
 .card small{font-size:10px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase;}
 .bars{border-top:1px solid var(--line);padding-top:8px;}
 .brow{display:grid;grid-template-columns:70px 1fr 40px;gap:12px;align-items:center;padding:7px 0;font-size:12.5px;transition:opacity .2s;}
-.bars.wide .brow{grid-template-columns:120px 1fr 40px;}
+.bars.wide .brow{grid-template-columns:1fr auto;gap:7px 14px;padding:12px 0;border-bottom:1px solid var(--line);}
+.bars.wide .brow:last-child{border-bottom:0;}
+.bars.wide .bk{grid-column:1;grid-row:1;white-space:normal;overflow:visible;text-overflow:clip;color:var(--fg);font-size:13px;line-height:1.4;overflow-wrap:anywhere;}
+.bars.wide .bv{grid-column:2;grid-row:1;align-self:start;}
+.bars.wide .bt{grid-column:1 / -1;grid-row:2;}
 .brow[style*="pointer"]:hover .bk{color:var(--g);}
 .brow .bk{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:color .2s;}
 .brow .bt{height:3px;background:var(--soft);border-radius:2px;overflow:hidden;}
@@ -795,9 +818,8 @@ nav button.on::before{width:18px;}
     <h1 class="lead">browse</h1>
     <p class="sub">students by program and <b>batch</b> (the year in the ID: 21, 22, 23... 26)</p>
     <div class="stack">
-      <div class="ac"><input id="prog" placeholder="program, tap to see suggestions" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search"><div class="sug" id="progSug"></div></div>
-      <div class="ac"><input id="batch" placeholder="batch, e.g. 24 (optional)" autocomplete="off" inputmode="numeric" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search"><div class="sug" id="batchSug"></div></div>
-      <button class="btn primary" id="browseBtn">list students</button>
+      <div class="pick" id="progBox" role="button" tabindex="0"><span class="lbl">program</span><span class="val" id="progVal">all programs</span></div>
+      <div class="pick" id="yearBox" role="button" tabindex="0"><span class="lbl">year</span><span class="val" id="yearVal">all years</span></div>
     </div>
   </section>
 
@@ -819,6 +841,8 @@ nav button.on::before{width:18px;}
   <div id="status"></div>
   <div id="out"></div>
 </main>
+
+<div id="sheet"><div class="sheet-bg" id="sheetBg"></div><div class="sheet-panel" id="sheetPanel"></div></div>
 
 <nav><div class="in">
   <button data-tab="find" class="on">find</button>
@@ -892,7 +916,7 @@ async function checkServer(){
 checkServer();
 
 function setStatus(m,k){STATUS.textContent=m||'';STATUS.className=k||'';}
-function setBusy(b){['checkBtn','scanBtn','allBtn','singleBtn','statsBtn','browseBtn'].forEach(id=>$(id).disabled=b);}
+function setBusy(b){['checkBtn','scanBtn','allBtn','singleBtn','statsBtn'].forEach(id=>$(id).disabled=b);}
 
 /* subtle scan effect: thin progress line + one rotating log line */
 const SCAN_LOGS={
@@ -1141,109 +1165,93 @@ async function loadCampus(name){
     window.scrollTo({top:0,behavior:'smooth'});
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
-/* browse by program + batch (typeahead) */
+/* browse: program + year pickers */
+let PSEL='',BSEL='';
 function norm(x){return String(x||'').toLowerCase().trim();}
-function findProgram(txt){
-  const t=norm(txt);if(!t||!PROG)return null;
-  return PROG.programs.find(p=>norm(p.program)===t)||null;
-}
-function programMatches(txt){
-  const t=norm(txt),words=t.split(/\s+/).filter(Boolean);
-  if(!t)return PROG.programs;
-  const a=[],b=[];
-  PROG.programs.forEach(p=>{
-    const n=norm(p.program);
-    if(n.startsWith(t))a.push(p);else if(n.includes(t)||words.every(w=>n.includes(w)))b.push(p);
-  });
-  return a.concat(b);
-}
-function resolveBatch(){
-  let t=norm($('batch').value).replace(/^batch\s*/,'');
-  if(!t)return '';
-  if(t==='?'||t==='no batch'||t==='none'||t==='no')return '?';
-  if(/^20\d\d$/.test(t))t=t.slice(2);
-  return t;
-}
-function batchOptions(){
-  const pg=findProgram($('prog').value);
+function batchLabel(b){return b==='?'?'no batch':'batch '+b;}
+const batchPairs=list=>list.map(([b,c])=>[batchLabel(b),c]);
+function batchOpts(){
+  const pg=PSEL?PROG.programs.find(x=>x.program===PSEL):null;
   return pg?pg.batches:PROG.batches;
 }
-function batchLabel(b){return b==='?'?'no batch':'batch '+b;}
-function closeSug(){$('progSug').classList.remove('on');$('batchSug').classList.remove('on');}
-function showSug(boxId,items,onPick){
-  const box=$(boxId);box.innerHTML='';
-  if(!items.length){box.classList.remove('on');return;}
-  items.slice(0,40).forEach(([label,count,val])=>{
-    const d=el('div');d.appendChild(el('span',null,label));d.appendChild(el('small',null,count));
-    d.addEventListener('pointerdown',e=>{e.preventDefault();box.classList.remove('on');onPick(val);});
-    box.appendChild(d);
-  });
-  box.classList.add('on');
+function closePicker(){$('sheet').classList.remove('on');}
+function openPicker(title,items,cur,onPick,searchable){
+  const panel=$('sheetPanel');panel.innerHTML='';
+  const head=el('div','sheet-head');head.appendChild(el('div','sheet-title',title));
+  let q=null;
+  if(searchable){
+    q=el('input');q.placeholder='type to filter';
+    ['autocomplete','autocorrect'].forEach(a=>q.setAttribute(a,'off'));q.setAttribute('autocapitalize','off');q.spellcheck=false;
+    head.appendChild(q);
+  }
+  const list=el('div','sheet-list');
+  panel.appendChild(head);panel.appendChild(list);
+  const draw=t=>{
+    const words=norm(t).split(/\s+/).filter(Boolean);
+    list.innerHTML='';let shown=0;
+    items.forEach(it=>{
+      const n=norm(it.label);
+      if(words.length&&it.value!==''&&!words.every(w=>n.includes(w)))return;
+      const o=el('div','opt'+(it.value===cur?' sel':''));
+      o.appendChild(el('span',null,it.label));
+      if(it.count!==undefined)o.appendChild(el('small',null,it.count));
+      o.onclick=()=>{closePicker();onPick(it.value);};
+      list.appendChild(o);shown++;
+    });
+    if(!shown)list.appendChild(el('div','empty','no match'));
+  };
+  draw('');
+  if(q)q.oninput=()=>draw(q.value);
+  $('sheet').classList.add('on');
+  if(q&&window.matchMedia&&matchMedia('(hover:hover)').matches)q.focus();
 }
-function progSug(){
-  if(!PROG)return;
-  $('batchSug').classList.remove('on');
-  showSug('progSug',programMatches($('prog').value).map(p=>[p.program,p.count,p.program]),v=>{
-    $('prog').value=v;fixBatch();runBrowse();
-  });
+function refreshBoxes(){
+  $('progVal').textContent=PSEL||'all programs';
+  $('yearVal').textContent=BSEL?batchLabel(BSEL):'all years';
+  $('progBox').classList.toggle('set',!!PSEL);
+  $('yearBox').classList.toggle('set',!!BSEL);
 }
-function batchSug(){
-  if(!PROG)return;
-  $('progSug').classList.remove('on');
-  const t=norm($('batch').value).replace(/^batch\s*/,'');
-  const list=batchOptions().filter(([b])=>!t||b.startsWith(t)||(b==='?'&&'no batch'.startsWith(t)));
-  showSug('batchSug',list.map(([b,c])=>[batchLabel(b),c,b]),v=>{
-    $('batch').value=v==='?'?'no batch':v;runBrowse();
-  });
+function openProg(){
+  if(!PROG){loadPrograms();return;}
+  const items=[{label:'all programs',value:'',count:PROG.total}]
+    .concat(PROG.programs.map(p=>({label:p.program,value:p.program,count:p.count})));
+  openPicker('program',items,PSEL,v=>{
+    PSEL=v;
+    if(BSEL&&!batchOpts().some(([x])=>x===BSEL))BSEL='';
+    refreshBoxes();runBrowse();
+  },true);
 }
-function fixBatch(){ /* drop a batch the picked program doesn't have */
-  const b=resolveBatch();
-  if(b&&!batchOptions().some(([x])=>x===b))$('batch').value='';
+function openYear(){
+  if(!PROG){loadPrograms();return;}
+  const pg=PSEL?PROG.programs.find(x=>x.program===PSEL):null;
+  const items=[{label:'all years',value:'',count:pg?pg.count:PROG.total}]
+    .concat(batchOpts().map(([b,c])=>({label:batchLabel(b),value:b,count:c})));
+  openPicker('year',items,BSEL,v=>{BSEL=v;refreshBoxes();runBrowse();},false);
 }
 function pickBatch(label){
-  $('batch').value=label==='no batch'?'no batch':label.replace('batch ','');runBrowse();
+  BSEL=label==='no batch'?'?':label.replace('batch ','');refreshBoxes();runBrowse();
 }
-function pickProgram(name){$('prog').value=name;fixBatch();runBrowse();}
-const batchPairs=list=>list.map(([b,c])=>[batchLabel(b),c]);
-function renderPrograms(){
+function renderOverview(){
   OUT.innerHTML='';
-  OUT.appendChild(sum(['<b>'+PROG.programs.length+'</b> programs','<b>'+PROG.batches.length+'</b> batches','<b>'+PROG.total+'</b> students']));
-  OUT.appendChild(h3('students per batch',PROG.batches.length));
+  OUT.appendChild(sum(['<b>'+PROG.programs.length+'</b> programs','<b>'+PROG.batches.length+'</b> years','<b>'+PROG.total+'</b> students']));
+  OUT.appendChild(h3('students per year',PROG.batches.length));
   OUT.appendChild(bars(batchPairs(PROG.batches),pickBatch));
-  OUT.appendChild(h3('students per program',PROG.programs.length));
-  OUT.appendChild(bars(PROG.programs.slice(0,60).map(p=>[p.program,p.count]),pickProgram,true));
-  if(PROG.programs.length>60)OUT.appendChild(el('div','hint','top 60 of '+PROG.programs.length+' shown, type a program above to find the rest'));
-  else OUT.appendChild(el('div','hint','tap a program or batch to list students'));
+  OUT.appendChild(el('div','hint','pick a program or a year above to list students'));
 }
 async function loadPrograms(){
   setBusy(true);
   try{
     const r=await runScan('stats',()=>withTimeout('/programs',{},20000));
     if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
-    PROG=await r.json();
-    setStatus('[+] '+PROG.programs.length+' programs, '+PROG.batches.length+' batches','ok');
-    renderPrograms();
+    PROG=await r.json();refreshBoxes();
+    setStatus('[+] '+PROG.programs.length+' programs, '+PROG.batches.length+' years','ok');
+    renderOverview();
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
 async function runBrowse(){
   if(!PROG){loadPrograms();return;}
-  closeSug();
-  const ptxt=$('prog').value.trim();
-  let p='';
-  if(ptxt){
-    let pg=findProgram(ptxt);
-    if(!pg){const m=programMatches(ptxt);if(m.length===1)pg=m[0];}
-    if(!pg){
-      const n=programMatches(ptxt).length;
-      setStatus(n?'[!] '+n+' programs match, pick one from the suggestions':'[-] no program matches "'+ptxt+'"','bad');
-      if(n)progSug();return;
-    }
-    p=pg.program;$('prog').value=p;
-  }
-  fixBatch();
-  const b=resolveBatch();
-  if(b&&!PROG.batches.some(([x])=>x===b)){setStatus('[-] no batch "'+b+'"','bad');batchSug();return;}
-  if(!p&&!b){setStatus('[+] overview','ok');renderPrograms();return;}
+  const p=PSEL,b=BSEL;
+  if(!p&&!b){setStatus('[+] overview','ok');renderOverview();return;}
   const qs=[];if(p)qs.push('program='+encodeURIComponent(p));if(b)qs.push('batch='+encodeURIComponent(b));
   setBusy(true);
   try{
@@ -1253,9 +1261,9 @@ async function runBrowse(){
     setStatus('[+] '+j.count+' student'+(j.count===1?'':'s')+(p?' in '+p:'')+(b?(b==='?'?' with no batch':' from batch '+b):''),'ok');
     renderAll(j);
     const pg=p?PROG.programs.find(x=>x.program===p):null;
-    if(pg){
+    if(pg&&pg.batches.length>1){
       const first=OUT.firstChild;
-      OUT.insertBefore(h3('batches in '+p,pg.batches.length),first);
+      OUT.insertBefore(h3('years in this program',pg.batches.length),first);
       OUT.insertBefore(bars(batchPairs(pg.batches),pickBatch),first);
     }
     window.scrollTo({top:0,behavior:'smooth'});
@@ -1315,16 +1323,12 @@ $('allBtn').onclick=scanAll;
 $('checkBtn').onclick=checkList;
 $('clearBtn').onclick=clearAll;
 $('statsBtn').onclick=loadStats;
-$('browseBtn').onclick=runBrowse;
-['prog','batch'].forEach(id=>{
-  const inp=$(id),fn=id==='prog'?progSug:batchSug;
-  inp.addEventListener('input',()=>{if(id==='prog')fixBatch();fn();});
-  inp.addEventListener('focus',fn);
-  inp.addEventListener('click',fn);
-  inp.addEventListener('blur',()=>setTimeout(()=>$(id+'Sug').classList.remove('on'),160));
-  inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();inp.blur();runBrowse();}});
+[['progBox',openProg],['yearBox',openYear]].forEach(([id,fn])=>{
+  const b=$(id);b.onclick=fn;
+  b.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();fn();}});
 });
-$('days').onchange=()=>{if(STATS_LOADED)loadStats();};
+$('sheetBg').onclick=closePicker;
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closePicker();});
 SINGLE.addEventListener('keydown',e=>{if(e.key==='Enter')lookupSingle();});
 </script>
 </body>
