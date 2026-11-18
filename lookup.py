@@ -656,6 +656,14 @@ select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/
   background-repeat:no-repeat;background-position:right 2px center;padding-right:24px;}
 select option{background:#111;color:#ddd;}
 .stack{display:flex;flex-direction:column;gap:14px;}
+.ac{position:relative;}
+.sug{display:none;position:absolute;left:0;right:0;top:100%;z-index:25;max-height:270px;overflow:auto;
+  background:#0f1110;border:1px solid var(--line);border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.6);margin-top:4px;}
+.sug.on{display:block;animation:rise .18s ease;}
+.sug div{display:flex;justify-content:space-between;gap:14px;padding:12px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--line);}
+.sug div:last-child{border-bottom:0;}
+.sug div:hover,.sug div:active{background:var(--soft);color:var(--g);}
+.sug small{color:var(--muted);flex:none;font-size:11px;}
 .btn{
   height:46px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--fg);
   font:inherit;font-size:13px;font-weight:600;letter-spacing:.04em;cursor:pointer;padding:0 22px;width:100%;
@@ -787,8 +795,8 @@ nav button.on::before{width:18px;}
     <h1 class="lead">browse</h1>
     <p class="sub">students by program and <b>batch</b> (the year in the ID: 21, 22, 23... 26)</p>
     <div class="stack">
-      <select id="prog" aria-label="Program"><option value="">all programs</option></select>
-      <select id="batch" aria-label="Batch"><option value="">all batches</option></select>
+      <div class="ac"><input id="prog" placeholder="program, tap to see suggestions" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search"><div class="sug" id="progSug"></div></div>
+      <div class="ac"><input id="batch" placeholder="batch, e.g. 24 (optional)" autocomplete="off" inputmode="numeric" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search"><div class="sug" id="batchSug"></div></div>
       <button class="btn primary" id="browseBtn">list students</button>
     </div>
   </section>
@@ -1133,51 +1141,108 @@ async function loadCampus(name){
     window.scrollTo({top:0,behavior:'smooth'});
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
-/* browse by program + batch */
-function addOpt(sel,v,t){const o=document.createElement('option');o.value=v;o.textContent=t;sel.appendChild(o);}
-function fillProgramSelects(){
-  const ps=$('prog'),curP=ps.value;
-  ps.innerHTML='';addOpt(ps,'','all programs ('+PROG.total+')');
-  PROG.programs.forEach(p=>addOpt(ps,p.program,p.program+' ('+p.count+')'));
-  if([...ps.options].some(o=>o.value===curP))ps.value=curP;
-  fillBatches();
+/* browse by program + batch (typeahead) */
+function norm(x){return String(x||'').toLowerCase().trim();}
+function findProgram(txt){
+  const t=norm(txt);if(!t||!PROG)return null;
+  return PROG.programs.find(p=>norm(p.program)===t)||null;
 }
-function fillBatches(){
-  const bs=$('batch'),cur=bs.value,p=$('prog').value;
-  const pg=p?PROG.programs.find(x=>x.program===p):null;
-  const list=pg?pg.batches:PROG.batches;
-  bs.innerHTML='';addOpt(bs,'','all batches');
-  list.forEach(([b,c])=>addOpt(bs,b,(b==='?'?'no batch':'batch '+b)+' ('+c+')'));
-  if([...bs.options].some(o=>o.value===cur))bs.value=cur;
+function programMatches(txt){
+  const t=norm(txt),words=t.split(/\s+/).filter(Boolean);
+  if(!t)return PROG.programs;
+  const a=[],b=[];
+  PROG.programs.forEach(p=>{
+    const n=norm(p.program);
+    if(n.startsWith(t))a.push(p);else if(n.includes(t)||words.every(w=>n.includes(w)))b.push(p);
+  });
+  return a.concat(b);
+}
+function resolveBatch(){
+  let t=norm($('batch').value).replace(/^batch\s*/,'');
+  if(!t)return '';
+  if(t==='?'||t==='no batch'||t==='none'||t==='no')return '?';
+  if(/^20\d\d$/.test(t))t=t.slice(2);
+  return t;
+}
+function batchOptions(){
+  const pg=findProgram($('prog').value);
+  return pg?pg.batches:PROG.batches;
+}
+function batchLabel(b){return b==='?'?'no batch':'batch '+b;}
+function closeSug(){$('progSug').classList.remove('on');$('batchSug').classList.remove('on');}
+function showSug(boxId,items,onPick){
+  const box=$(boxId);box.innerHTML='';
+  if(!items.length){box.classList.remove('on');return;}
+  items.slice(0,40).forEach(([label,count,val])=>{
+    const d=el('div');d.appendChild(el('span',null,label));d.appendChild(el('small',null,count));
+    d.addEventListener('pointerdown',e=>{e.preventDefault();box.classList.remove('on');onPick(val);});
+    box.appendChild(d);
+  });
+  box.classList.add('on');
+}
+function progSug(){
+  if(!PROG)return;
+  $('batchSug').classList.remove('on');
+  showSug('progSug',programMatches($('prog').value).map(p=>[p.program,p.count,p.program]),v=>{
+    $('prog').value=v;fixBatch();runBrowse();
+  });
+}
+function batchSug(){
+  if(!PROG)return;
+  $('progSug').classList.remove('on');
+  const t=norm($('batch').value).replace(/^batch\s*/,'');
+  const list=batchOptions().filter(([b])=>!t||b.startsWith(t)||(b==='?'&&'no batch'.startsWith(t)));
+  showSug('batchSug',list.map(([b,c])=>[batchLabel(b),c,b]),v=>{
+    $('batch').value=v==='?'?'no batch':v;runBrowse();
+  });
+}
+function fixBatch(){ /* drop a batch the picked program doesn't have */
+  const b=resolveBatch();
+  if(b&&!batchOptions().some(([x])=>x===b))$('batch').value='';
 }
 function pickBatch(label){
-  const b=label==='no batch'?'?':label.replace('batch ','');
-  $('batch').value=b;runBrowse();
+  $('batch').value=label==='no batch'?'no batch':label.replace('batch ','');runBrowse();
 }
-function pickProgram(name){$('prog').value=name;fillBatches();runBrowse();}
-const batchPairs=list=>list.map(([b,c])=>[b==='?'?'no batch':'batch '+b,c]);
+function pickProgram(name){$('prog').value=name;fixBatch();runBrowse();}
+const batchPairs=list=>list.map(([b,c])=>[batchLabel(b),c]);
 function renderPrograms(){
   OUT.innerHTML='';
   OUT.appendChild(sum(['<b>'+PROG.programs.length+'</b> programs','<b>'+PROG.batches.length+'</b> batches','<b>'+PROG.total+'</b> students']));
-  OUT.appendChild(h3('students per program',PROG.programs.length));
-  OUT.appendChild(bars(PROG.programs.map(p=>[p.program,p.count]),pickProgram,true));
   OUT.appendChild(h3('students per batch',PROG.batches.length));
   OUT.appendChild(bars(batchPairs(PROG.batches),pickBatch));
-  OUT.appendChild(el('div','hint','tap a program or batch to list students'));
+  OUT.appendChild(h3('students per program',PROG.programs.length));
+  OUT.appendChild(bars(PROG.programs.slice(0,60).map(p=>[p.program,p.count]),pickProgram,true));
+  if(PROG.programs.length>60)OUT.appendChild(el('div','hint','top 60 of '+PROG.programs.length+' shown, type a program above to find the rest'));
+  else OUT.appendChild(el('div','hint','tap a program or batch to list students'));
 }
 async function loadPrograms(){
   setBusy(true);
   try{
     const r=await runScan('stats',()=>withTimeout('/programs',{},20000));
     if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
-    PROG=await r.json();fillProgramSelects();
+    PROG=await r.json();
     setStatus('[+] '+PROG.programs.length+' programs, '+PROG.batches.length+' batches','ok');
     renderPrograms();
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
 async function runBrowse(){
   if(!PROG){loadPrograms();return;}
-  const p=$('prog').value,b=$('batch').value;
+  closeSug();
+  const ptxt=$('prog').value.trim();
+  let p='';
+  if(ptxt){
+    let pg=findProgram(ptxt);
+    if(!pg){const m=programMatches(ptxt);if(m.length===1)pg=m[0];}
+    if(!pg){
+      const n=programMatches(ptxt).length;
+      setStatus(n?'[!] '+n+' programs match, pick one from the suggestions':'[-] no program matches "'+ptxt+'"','bad');
+      if(n)progSug();return;
+    }
+    p=pg.program;$('prog').value=p;
+  }
+  fixBatch();
+  const b=resolveBatch();
+  if(b&&!PROG.batches.some(([x])=>x===b)){setStatus('[-] no batch "'+b+'"','bad');batchSug();return;}
   if(!p&&!b){setStatus('[+] overview','ok');renderPrograms();return;}
   const qs=[];if(p)qs.push('program='+encodeURIComponent(p));if(b)qs.push('batch='+encodeURIComponent(b));
   setBusy(true);
@@ -1251,8 +1316,14 @@ $('checkBtn').onclick=checkList;
 $('clearBtn').onclick=clearAll;
 $('statsBtn').onclick=loadStats;
 $('browseBtn').onclick=runBrowse;
-$('prog').onchange=()=>{fillBatches();runBrowse();};
-$('batch').onchange=runBrowse;
+['prog','batch'].forEach(id=>{
+  const inp=$(id),fn=id==='prog'?progSug:batchSug;
+  inp.addEventListener('input',()=>{if(id==='prog')fixBatch();fn();});
+  inp.addEventListener('focus',fn);
+  inp.addEventListener('click',fn);
+  inp.addEventListener('blur',()=>setTimeout(()=>$(id+'Sug').classList.remove('on'),160));
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();inp.blur();runBrowse();}});
+});
 $('days').onchange=()=>{if(STATS_LOADED)loadStats();};
 SINGLE.addEventListener('keydown',e=>{if(e.key==='Enter')lookupSingle();});
 </script>
