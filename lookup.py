@@ -7,13 +7,21 @@ import time
 import traceback
 import unicodedata
 import urllib.request
-from datetime import datetime, date
+from collections import Counter
+from datetime import datetime, date, timedelta, timezone
 from difflib import SequenceMatcher
 
 from flask import Flask, jsonify, request
 from openpyxl import load_workbook
 
 GITHUB_RAW = os.environ.get("XLSX_URL", "").strip()
+
+# Server runs in UTC on most hosts; this keeps "today" / age correct for your timezone.
+# Philippines / Singapore = 8. Override with env TZ_OFFSET_HOURS.
+try:
+    TZ_OFFSET_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", "8"))
+except ValueError:
+    TZ_OFFSET_HOURS = 8.0
 
 # Columns surfaced in every response. Password is deliberately excluded.
 VISIBLE = ["Student ID", "Name", "Birthday", "Campus", "Program"]
@@ -48,6 +56,7 @@ def resolve_xlsx_path():
 XLSX_PATH = resolve_xlsx_path()
 SHEET_NAME = "Sheet1"
 FUZZY_MIN = 0.72
+CANDIDATE_LIMIT = 80
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
@@ -71,6 +80,62 @@ _MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
 _MONTH_RE = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
              r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
              r"Nov(?:ember)?|Dec(?:ember)?)")
+
+
+# ----------------------------------------------------------------------------
+# time / age helpers
+# ----------------------------------------------------------------------------
+def _today():
+    return (datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)).date()
+
+
+def _age_on(y, m, d, today):
+    return today.year - y - ((today.month, today.day) < (m, d))
+
+
+def _next_birthday(m, d, today):
+    for yr in (today.year, today.year + 1):
+        try:
+            nb = date(yr, m, d)
+        except ValueError:  # Feb 29 on a non-leap year
+            nb = date(yr, 2, 28)
+        if nb >= today:
+            return nb
+    return None
+
+
+_ZODIAC = [
+    (1, 20, "Capricorn"), (2, 19, "Aquarius"), (3, 21, "Pisces"), (4, 20, "Aries"),
+    (5, 21, "Taurus"), (6, 21, "Gemini"), (7, 23, "Cancer"), (8, 23, "Leo"),
+    (9, 23, "Virgo"), (10, 23, "Libra"), (11, 22, "Scorpio"), (12, 22, "Sagittarius"),
+]
+
+
+def _zodiac(m, d):
+    for em, ed, name in _ZODIAC:
+        if (m, d) < (em, ed):
+            return name
+    return "Capricorn"
+
+
+def _derived(m, d, y, today=None):
+    """Age / days-to-next-birthday / zodiac from month, day and (optional) year."""
+    today = today or _today()
+    out = {"Age": "", "DaysToBday": "", "Zodiac": ""}
+    if not m or not d:
+        return out
+    try:
+        nb = _next_birthday(m, d, today)
+        if nb:
+            out["DaysToBday"] = (nb - today).days
+        out["Zodiac"] = _zodiac(m, d)
+        if y:
+            age = _age_on(y, m, d, today)
+            if 0 <= age <= 120:
+                out["Age"] = age
+    except Exception:
+        pass
+    return out
 
 
 def fetch_from_github():
@@ -296,6 +361,8 @@ def _load_index():
                 "program": _cell_to_str(cell(prog_i)),
                 "birthday_month": bd_parsed.month if bd_parsed else None,
                 "birthday_day": bd_parsed.day if bd_parsed else None,
+                # 1900 is the placeholder year used when a birthday has no year
+                "birthday_year": (bd_parsed.year if bd_parsed and bd_parsed.year != 1900 else None),
                 "name_tokens": tuple(name_tokens),
                 "id_folded": id_folded,
             })
@@ -393,14 +460,69 @@ def match_index(idx, line, min_score=FUZZY_MIN):
     return None
 
 
-def row_to_public(row):
-    """Map an index row to the public field set (VISIBLE order)."""
+# ----------------------------------------------------------------------------
+# candidate search: "james" -> every student with a James in their name
+# ----------------------------------------------------------------------------
+def _tok_match(qt, ct):
+    if qt == ct:
+        return 1.0
+    if len(qt) >= 2 and ct.startswith(qt):
+        return 0.92
+    if len(qt) >= 3 and qt in ct:
+        return 0.80
+    if len(qt) >= 3 and abs(len(qt) - len(ct)) <= 2:
+        sm = SequenceMatcher(None, qt, ct)
+        if sm.real_quick_ratio() >= 0.8 and sm.quick_ratio() >= 0.8:
+            r = sm.ratio()
+            if r >= 0.8:
+                return r * 0.85
+    return 0.0
+
+
+def find_candidates(idx, q, limit=CANDIDATE_LIMIT):
+    """Every row where each query token matches some name token.
+    Returns (list of (score, index) best-first, total_found)."""
+    qt = _tokens(q)
+    if not qt:
+        return [], 0
+    rows = idx["rows"]
+    found = []
+    for i, r in enumerate(rows):
+        ct = r["name_tokens"]
+        if not ct:
+            continue
+        total = 0.0
+        ok = True
+        for t in qt:
+            best = 0.0
+            for c in ct:
+                m = _tok_match(t, c)
+                if m > best:
+                    best = m
+                    if best == 1.0:
+                        break
+            if best == 0.0:
+                ok = False
+                break
+            total += best
+        if ok:
+            found.append((total / len(qt), i))
+    found.sort(key=lambda x: (-x[0], rows[x[1]]["name"].lower()))
+    return found[:limit], len(found)
+
+
+def row_to_public(row, today=None):
+    """Map an index row to the public field set (VISIBLE order + derived fields)."""
+    d = _derived(row["birthday_month"], row["birthday_day"], row["birthday_year"], today)
     return {
         "Student ID": row["id"],
         "Name": row["name"],
         "Birthday": row["birthday"],
         "Campus": row["campus"],
         "Program": row["program"],
+        "Age": d["Age"],
+        "Zodiac": d["Zodiac"],
+        "DaysToBday": d["DaysToBday"],
     }
 
 
@@ -419,8 +541,8 @@ def student_from_index(idx, i):
 
 def resolve_month(raw):
     if raw is None or raw == "":
-        d = datetime.now()
-        return d.month, _MONTH_NAMES[d.month]
+        m = _today().month
+        return m, _MONTH_NAMES[m]
     s = str(raw).strip()
     if s.isdigit():
         n = int(s)
@@ -449,168 +571,218 @@ def _err(where, e, t0):
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="green">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#fbfbfa">
-<meta name="color-scheme" content="light dark">
-<title>Lookup</title>
+<meta name="theme-color" content="#09090a">
+<meta name="color-scheme" content="dark">
+<title>lookup</title>
 <style>
 :root{
-  --bg:#fbfbfa;--surface:#ffffff;--line:#ebebe8;--fg:#161615;--muted:#8a8a84;
-  --accent:#161615;--accent-fg:#ffffff;--soft:#f3f3f0;--ok:#2f7d4f;--bad:#c0392b;
-  --r:16px;
+  --g:#3dff8f;--bg:#09090a;--fg:#dfe3df;--muted:#6c746e;--line:rgba(255,255,255,.075);
+  --soft:rgba(255,255,255,.035);--bad:#ff6b6b;
 }
-html[data-theme="dark"]{
-  --bg:#0f0f10;--surface:#171718;--line:#262628;--fg:#ececea;--muted:#7d7d82;
-  --accent:#ececea;--accent-fg:#0f0f10;--soft:#1e1e20;--ok:#5fc08a;--bad:#f0776b;
-}
+html[data-theme="amber"]{--g:#ffb454;}
+html[data-theme="red"]{--g:#ff5c6c;--bad:#ffd166;}
+html[data-theme="cyan"]{--g:#4fd8ff;}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
 html,body{margin:0;background:var(--bg);color:var(--fg);}
 body{
-  font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
-  -webkit-font-smoothing:antialiased;
-  padding-bottom:calc(84px + env(safe-area-inset-bottom));
+  font:14px/1.55 ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  -webkit-font-smoothing:antialiased;min-height:100vh;
+  padding-bottom:calc(72px + env(safe-area-inset-bottom));
+  background:
+    radial-gradient(900px 420px at 50% -120px,color-mix(in srgb,var(--g) 9%,transparent),transparent 70%),
+    var(--bg);
+  background-attachment:fixed;
 }
-.wrap{max-width:640px;margin:0 auto;padding:0 18px;}
+.wrap{max-width:620px;margin:0 auto;padding:0 22px;}
+::selection{background:var(--g);color:#000;}
+
+/* top progress line */
+#prog{position:fixed;left:0;top:0;height:2px;width:0;background:var(--g);z-index:50;opacity:0;
+  box-shadow:0 0 12px var(--g);transition:width .2s ease,opacity .3s ease;}
 
 /* header */
-header{
-  position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);
-  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-  padding-top:env(safe-area-inset-top);
-}
+header{position:sticky;top:0;z-index:20;padding-top:env(safe-area-inset-top);
+  background:linear-gradient(var(--bg) 60%,transparent);}
 .bar{display:flex;align-items:center;justify-content:space-between;height:60px;}
-.brand{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:600;letter-spacing:-.01em;}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);transition:background .2s;}
-.dot.ok{background:var(--ok);}
+.brand{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);letter-spacing:.04em;}
+.brand b{color:var(--fg);font-weight:600;}
+.brand b::after{content:"_";color:var(--g);animation:blink 1.1s steps(1) infinite;}
+@keyframes blink{50%{opacity:0;}}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--muted);transition:background .3s,box-shadow .3s;}
+.dot.ok{background:var(--g);box-shadow:0 0 8px var(--g);}
 .dot.bad{background:var(--bad);}
-.icon-btn{
-  width:44px;height:44px;border-radius:50%;border:0;background:transparent;color:var(--fg);
-  font-size:18px;display:grid;place-items:center;cursor:pointer;
-}
-.icon-btn:active{background:var(--soft);}
+#theme{width:30px;height:30px;border:0;background:transparent;display:grid;place-items:center;cursor:pointer;border-radius:50%;}
+#theme i{width:10px;height:10px;border-radius:50%;background:var(--g);box-shadow:0 0 10px var(--g);display:block;transition:transform .2s;}
+#theme:active i{transform:scale(1.5);}
 
 /* panels */
-.panel{display:none;padding-top:8px;animation:fade .18s ease;}
-.panel.on{display:block;}
-@keyframes fade{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}
-.lead{font-size:26px;font-weight:650;letter-spacing:-.02em;margin:8px 0 18px;line-height:1.2;}
-.lead span{color:var(--muted);font-weight:500;}
+.panel{display:none;padding-top:18px;}
+.panel.on{display:block;animation:rise .35s cubic-bezier(.2,.7,.2,1);}
+@keyframes rise{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;}}
+.lead{font-size:30px;font-weight:300;letter-spacing:-.02em;margin:0 0 4px;color:var(--fg);}
+.lead::after{content:"_";color:var(--g);}
+.sub{color:var(--muted);font-size:12.5px;margin:0 0 26px;}
+.sub b{color:var(--g);font-weight:500;}
 
-/* inputs: 16px to stop Android/Chrome zoom, 52px tall for thumbs */
+/* inputs */
 input,select,textarea{
-  width:100%;font:inherit;font-size:16px;color:var(--fg);background:var(--surface);
-  border:1px solid var(--line);border-radius:var(--r);padding:0 16px;height:52px;
-  outline:none;transition:border-color .15s,box-shadow .15s;appearance:none;-webkit-appearance:none;
+  width:100%;font:inherit;font-size:16px;color:var(--fg);background:transparent;border:0;
+  border-bottom:1px solid var(--line);border-radius:0;padding:0;height:52px;outline:none;
+  transition:border-color .25s;appearance:none;-webkit-appearance:none;caret-color:var(--g);
 }
-input:focus,select:focus,textarea:focus{border-color:var(--fg);box-shadow:0 0 0 3px color-mix(in srgb,var(--fg) 8%,transparent);}
-textarea{height:auto;min-height:170px;padding:14px 16px;resize:vertical;line-height:1.55;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;}
-select{
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none' stroke='%238a8a84' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 18px center;padding-right:44px;
-}
-.stack{display:flex;flex-direction:column;gap:10px;}
+input.big{font-size:20px;}
+input::placeholder,textarea::placeholder{color:var(--muted);opacity:.7;}
+input:focus,select:focus{border-bottom-color:var(--g);}
+textarea{height:auto;min-height:170px;padding:14px 16px;border:0;border-radius:12px;background:var(--soft);
+  resize:vertical;line-height:1.6;font-size:14px;transition:box-shadow .25s;}
+textarea:focus{box-shadow:0 0 0 1px var(--g);}
+select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none' stroke='%236c746e' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 2px center;padding-right:24px;}
+select option{background:#111;color:#ddd;}
+.stack{display:flex;flex-direction:column;gap:14px;}
 .btn{
-  height:52px;border-radius:var(--r);border:1px solid var(--line);background:var(--surface);color:var(--fg);
-  font:inherit;font-size:15px;font-weight:600;cursor:pointer;padding:0 20px;width:100%;
-  transition:transform .08s,opacity .15s;
+  height:46px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--fg);
+  font:inherit;font-size:13px;font-weight:600;letter-spacing:.04em;cursor:pointer;padding:0 22px;width:100%;
+  transition:transform .12s,background .2s,box-shadow .2s,border-color .2s;
 }
+.btn:hover{border-color:color-mix(in srgb,var(--g) 55%,transparent);}
 .btn:active{transform:scale(.985);}
-.btn.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);}
-.btn.ghost{background:transparent;}
-.btn:disabled{opacity:.45;pointer-events:none;}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
-.filebtn{display:flex;align-items:center;justify-content:center;gap:8px;height:52px;border-radius:var(--r);
-  border:1px dashed var(--line);color:var(--muted);font-size:14px;cursor:pointer;background:transparent;}
+.btn.primary{background:var(--g);color:#04110a;border-color:var(--g);}
+.btn.primary:hover{box-shadow:0 0 22px color-mix(in srgb,var(--g) 40%,transparent);}
+.btn.ghost{color:var(--muted);}
+.btn.sm{height:38px;font-size:12px;width:auto;margin-top:18px;}
+.btn:disabled{opacity:.35;pointer-events:none;}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.filebtn{display:flex;align-items:center;justify-content:center;height:44px;border-radius:999px;
+  border:1px dashed var(--line);color:var(--muted);font-size:12.5px;cursor:pointer;transition:border-color .2s,color .2s;}
+.filebtn:hover{border-color:var(--g);color:var(--g);}
 .filebtn input{display:none;}
+.hint{color:var(--muted);font-size:12px;margin-top:16px;text-align:center;}
+
+/* status */
+#status{min-height:22px;font-size:12px;color:var(--muted);margin:22px 0 6px;word-break:break-word;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#status.ok{color:var(--g);}
+#status.bad{color:var(--bad);white-space:normal;}
+#out{animation:rise .35s cubic-bezier(.2,.7,.2,1);}
 
 /* results */
-#status{min-height:20px;font-size:13px;color:var(--muted);margin:22px 0 4px;word-break:break-word;}
-#status.ok{color:var(--muted);}
-#status.bad{color:var(--bad);}
-.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--muted);border-top-color:transparent;
-  border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:8px;}
-@keyframes sp{to{transform:rotate(360deg);}}
-.sum{display:flex;gap:6px 14px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin:10px 0 12px;}
+.sum{display:flex;gap:4px 16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:6px 0 10px;}
 .sum b{color:var(--fg);font-weight:600;}
-.h3{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:26px 0 10px;}
-.list{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;}
-.item{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:flex-start;}
-.item:last-child{border-bottom:0;}
-.item .body{flex:1;min-width:0;}
-.item .nm{font-weight:600;font-size:15px;overflow-wrap:anywhere;}
-.item .mt{font-size:13px;color:var(--muted);margin-top:2px;overflow-wrap:anywhere;}
-.badge{flex:none;min-width:46px;text-align:center;padding:5px 9px;border-radius:12px;background:var(--soft);
-  font-size:12px;font-weight:600;line-height:1.25;}
-.badge small{display:block;font-size:10px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;}
-.badge.hot{background:var(--accent);color:var(--accent-fg);}
-.badge.hot small{color:inherit;opacity:.7;}
-.tag{display:inline-block;font-size:11px;color:var(--muted);background:var(--soft);padding:1px 8px;border-radius:999px;margin-top:6px;}
-.empty{color:var(--muted);text-align:center;padding:36px 12px;font-size:14px;}
-.err{border:1px solid var(--bad);border-radius:var(--r);padding:12px 14px;color:var(--bad);font-size:13px;margin-bottom:12px;word-break:break-word;}
-.kv{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:6px 16px;}
-.kv div{display:flex;justify-content:space-between;gap:16px;padding:11px 0;border-bottom:1px solid var(--line);font-size:14px;}
-.kv div:last-child{border-bottom:0;}
-.kv span:first-child{color:var(--muted);flex:none;}
-.kv span:last-child{text-align:right;font-weight:500;overflow-wrap:anywhere;}
-.more{margin-top:12px;}
+.h3{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:34px 0 6px;}
+.h3 em{font-style:normal;color:var(--g);margin-left:8px;}
+.list{border-top:1px solid var(--line);}
+.item{padding:14px 2px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:center;justify-content:space-between;
+  transition:background .2s,padding .2s;}
+.item.click{cursor:pointer;}
+.item.click:hover{background:var(--soft);padding-left:10px;padding-right:10px;}
+.item .body{min-width:0;flex:1;}
+.item .nm{font-weight:500;font-size:14.5px;overflow-wrap:anywhere;}
+.item .mt{font-size:12px;color:var(--muted);overflow-wrap:anywhere;}
+.item .side{flex:none;text-align:right;line-height:1.2;}
+.item .age{font-size:20px;font-weight:300;color:var(--g);font-variant-numeric:tabular-nums;}
+.item .age small{font-size:10px;color:var(--muted);margin-left:3px;letter-spacing:.06em;}
+.item .dt{font-size:11px;color:var(--muted);margin-top:3px;}
+.pill{display:inline-block;font-size:10px;letter-spacing:.08em;color:var(--g);border:1px solid color-mix(in srgb,var(--g) 45%,transparent);
+  padding:0 7px;border-radius:999px;margin-top:5px;margin-right:5px;line-height:1.6;text-transform:uppercase;}
+.pill.hot{background:var(--g);color:#04110a;border-color:var(--g);font-weight:700;}
+.pill.mute{color:var(--muted);border-color:var(--line);}
+.empty{color:var(--muted);text-align:center;padding:34px 12px;font-size:13px;}
+.err{border:1px solid var(--bad);border-radius:12px;padding:12px 14px;color:var(--bad);font-size:12px;margin-bottom:12px;word-break:break-word;}
+.kv{border-top:1px solid var(--line);}
+.kv div{display:flex;justify-content:space-between;gap:20px;padding:12px 2px;border-bottom:1px solid var(--line);font-size:13.5px;}
+.kv span:first-child{color:var(--muted);flex:none;font-size:11px;letter-spacing:.12em;text-transform:uppercase;padding-top:2px;}
+.kv span:last-child{text-align:right;overflow-wrap:anywhere;}
+.kv .accent{color:var(--g);}
+.dossier-name{font-size:26px;font-weight:300;letter-spacing:-.01em;margin:10px 0 18px;overflow-wrap:anywhere;}
+.dossier-name small{display:block;font-size:11px;letter-spacing:.16em;color:var(--g);text-transform:uppercase;margin-bottom:6px;}
 
-/* bottom nav (thumb zone) */
-nav{
-  position:fixed;left:0;right:0;bottom:0;z-index:30;background:color-mix(in srgb,var(--bg) 90%,transparent);
-  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--line);
-  padding-bottom:env(safe-area-inset-bottom);
-}
-nav .in{display:grid;grid-template-columns:repeat(3,1fr);max-width:640px;margin:0 auto;}
-nav button{
-  height:64px;border:0;background:transparent;color:var(--muted);font:inherit;font-size:11px;font-weight:600;
-  letter-spacing:.02em;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;
-}
-nav button .i{font-size:20px;line-height:1;}
-nav button.on{color:var(--fg);}
-nav button:active{background:var(--soft);}
+/* stats */
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0 0;}
+.card b{display:block;font-size:26px;font-weight:300;color:var(--g);font-variant-numeric:tabular-nums;}
+.card small{font-size:10px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase;}
+.bars{border-top:1px solid var(--line);padding-top:8px;}
+.brow{display:grid;grid-template-columns:70px 1fr 40px;gap:12px;align-items:center;padding:7px 0;font-size:12.5px;transition:opacity .2s;}
+.bars.wide .brow{grid-template-columns:120px 1fr 40px;}
+.brow[style*="pointer"]:hover .bk{color:var(--g);}
+.brow .bk{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:color .2s;}
+.brow .bt{height:3px;background:var(--soft);border-radius:2px;overflow:hidden;}
+.brow .bt i{display:block;height:100%;background:var(--g);border-radius:2px;box-shadow:0 0 8px color-mix(in srgb,var(--g) 60%,transparent);}
+.brow .bv{text-align:right;color:var(--fg);font-variant-numeric:tabular-nums;}
+
+/* nav */
+nav{position:fixed;left:0;right:0;bottom:0;z-index:30;padding-bottom:env(safe-area-inset-bottom);
+  background:linear-gradient(transparent,var(--bg) 40%);}
+nav .in{display:grid;grid-template-columns:repeat(4,1fr);max-width:620px;margin:0 auto;}
+nav button{height:62px;border:0;background:transparent;color:var(--muted);font:inherit;font-size:12px;letter-spacing:.08em;
+  cursor:pointer;position:relative;transition:color .25s;}
+nav button::before{content:"";position:absolute;left:50%;top:10px;width:0;height:2px;background:var(--g);border-radius:2px;
+  transform:translateX(-50%);transition:width .25s;box-shadow:0 0 8px var(--g);}
+nav button.on{color:var(--g);}
+nav button.on::before{width:18px;}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
 </style>
 </head>
 <body>
+<div id="prog"></div>
+
 <header>
   <div class="wrap bar">
-    <div class="brand"><span class="dot" id="dot"></span><span>Lookup</span><span id="count" style="font-size:12px;color:var(--muted);font-weight:500"></span></div>
-    <button class="icon-btn" id="theme" aria-label="Toggle theme">◐</button>
+    <div class="brand"><span class="dot" id="dot"></span><b>lookup</b><span id="count"></span></div>
+    <button id="theme" aria-label="Change accent color"><i></i></button>
   </div>
 </header>
 
 <main class="wrap">
 
   <section class="panel on" id="p-find">
-    <h1 class="lead">Find a student<br><span>by name or ID</span></h1>
+    <h1 class="lead">find</h1>
+    <p class="sub">name, partial name or student ID. try just <b>james</b></p>
     <div class="stack">
-      <input id="single" placeholder="Name or student ID" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
-      <button class="btn primary" id="singleBtn">Search</button>
+      <input class="big" id="single" placeholder="who are you looking for" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+      <button class="btn primary" id="singleBtn">scan</button>
     </div>
   </section>
 
   <section class="panel" id="p-month">
-    <h1 class="lead">Birthdays<br><span>by month</span></h1>
+    <h1 class="lead">month</h1>
+    <p class="sub">every birthday in a month, with ages</p>
     <div class="stack">
       <select id="month" aria-label="Month"></select>
-      <button class="btn primary" id="scanBtn">Show this month</button>
-      <button class="btn ghost" id="allBtn">Browse everyone</button>
+      <button class="btn primary" id="scanBtn">sweep month</button>
+      <button class="btn ghost" id="allBtn">browse everyone</button>
     </div>
   </section>
 
   <section class="panel" id="p-list">
-    <h1 class="lead">Class list<br><span>check birthdays</span></h1>
+    <h1 class="lead">list</h1>
+    <p class="sub">paste a class list, see who has a birthday in the selected month</p>
     <div class="stack">
-      <textarea id="paste" wrap="off" placeholder="One per line&#10;BALINO&#9;HERIE-JAY&#10;IGARTA ALVIN&#10;26-05959" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
-      <label class="filebtn"><input type="file" id="file" accept=".txt,text/plain"><span id="fileLbl">＋ Attach .txt file</span></label>
+      <textarea id="paste" wrap="off" placeholder="one per line&#10;BALINO&#9;HERIE-JAY&#10;IGARTA ALVIN&#10;26-05959" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+      <label class="filebtn"><input type="file" id="file" accept=".txt,text/plain"><span id="fileLbl">attach .txt</span></label>
       <div class="row2">
-        <button class="btn ghost" id="clearBtn">Clear</button>
-        <button class="btn primary" id="checkBtn">Check</button>
+        <button class="btn ghost" id="clearBtn">clear</button>
+        <button class="btn primary" id="checkBtn">check</button>
       </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-intel">
+    <h1 class="lead">intel</h1>
+    <p class="sub">today, incoming birthdays, students per campus</p>
+    <div class="stack">
+      <select id="days" aria-label="Look-ahead window">
+        <option value="7">next 7 days</option>
+        <option value="14">next 14 days</option>
+        <option value="30" selected>next 30 days</option>
+        <option value="60">next 60 days</option>
+        <option value="90">next 90 days</option>
+      </select>
+      <button class="btn primary" id="statsBtn">run recon</button>
     </div>
   </section>
 
@@ -619,9 +791,10 @@ nav button:active{background:var(--soft);}
 </main>
 
 <nav><div class="in">
-  <button data-tab="find" class="on"><span class="i">⌕</span>Find</button>
-  <button data-tab="month"><span class="i">◷</span>Month</button>
-  <button data-tab="list"><span class="i">☰</span>List</button>
+  <button data-tab="find" class="on">find</button>
+  <button data-tab="month">month</button>
+  <button data-tab="list">list</button>
+  <button data-tab="intel">intel</button>
 </div></nav>
 
 <script>
@@ -629,27 +802,32 @@ const $=id=>document.getElementById(id);
 const STATUS=$('status'),OUT=$('out'),PASTE=$('paste'),SINGLE=$('single');
 const MONTHS=["","January","February","March","April","May","June","July","August","September","October","November","December"];
 const BATCH_SIZE=400,RENDER_CAP=200,LS_PASTE='bday-paste';
-let LAST_ALL=null;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!==undefined&&x!==null)e.textContent=x;return e;}
 function safe(f){try{return f();}catch(_){return null;}}
+function esc(x){return String(x==null?'':x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
-/* theme */
+/* theme: tiny accent dot in the header */
+const THEMES=['green','amber','red','cyan'];
 function applyTheme(t){
+  if(THEMES.indexOf(t)<0)t='green';
   document.documentElement.setAttribute('data-theme',t);
-  $('theme').textContent=t==='dark'?'☀':'◐';
-  const m=document.querySelector('meta[name=theme-color]');
-  if(m)m.setAttribute('content',t==='dark'?'#0f0f10':'#fbfbfa');
-  safe(()=>localStorage.setItem('bday-theme',t));
+  safe(()=>localStorage.setItem('hk-theme',t));
 }
-applyTheme(safe(()=>localStorage.getItem('bday-theme'))||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));
-$('theme').onclick=()=>applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');
+applyTheme(safe(()=>localStorage.getItem('hk-theme'))||'green');
+$('theme').onclick=()=>{
+  const cur=document.documentElement.getAttribute('data-theme');
+  applyTheme(THEMES[(THEMES.indexOf(cur)+1)%THEMES.length]);
+};
 
 /* tabs */
+let STATS_LOADED=false;
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.id==='p-'+b.dataset.tab));
   window.scrollTo({top:0,behavior:'smooth'});
+  if(b.dataset.tab==='intel'&&!STATS_LOADED)loadStats();
 });
 
 /* month select */
@@ -657,7 +835,7 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   const cur=new Date().getMonth()+1,sel=$('month');
   for(let i=1;i<=12;i++){
     const o=document.createElement('option');o.value=i;
-    o.textContent=MONTHS[i]+(i===cur?'  ·  now':'');sel.appendChild(o);
+    o.textContent=MONTHS[i].toLowerCase()+(i===cur?'  (now)':'');sel.appendChild(o);
   }
   sel.value=cur;
 })();
@@ -667,7 +845,7 @@ const monthSel=()=>parseInt($('month').value,10);
 const saved=safe(()=>localStorage.getItem(LS_PASTE));if(saved)PASTE.value=saved;
 let _t=null;
 PASTE.addEventListener('input',()=>{clearTimeout(_t);_t=setTimeout(()=>safe(()=>localStorage.setItem(LS_PASTE,PASTE.value)),400);});
-$('file').onchange=e=>{$('fileLbl').textContent=e.target.files[0]?('✓ '+e.target.files[0].name):'＋ Attach .txt file';};
+$('file').onchange=e=>{$('fileLbl').textContent=e.target.files[0]?e.target.files[0].name:'attach .txt';};
 
 /* server status */
 async function checkServer(){
@@ -675,94 +853,145 @@ async function checkServer(){
   try{
     const j=await (await fetch('/healthz',{cache:'no-store'})).json();
     d.className='dot '+(j.ok?'ok':'bad');
-    $('count').textContent=j.ok?(j.rows+' students'):'';
+    $('count').textContent=j.ok?(j.rows+' records'):'';
     d.title=j.ok?'':(j.error||'error');
   }catch(e){d.className='dot bad';$('count').textContent='offline';}
 }
 checkServer();
 
-function setStatus(m,k){
-  STATUS.innerHTML='';
-  if(k==='load')STATUS.appendChild(el('span','spin'));
-  STATUS.appendChild(document.createTextNode(m||''));
-  STATUS.className=k==='load'?'':(k||'');
+function setStatus(m,k){STATUS.textContent=m||'';STATUS.className=k||'';}
+function setBusy(b){['checkBtn','scanBtn','allBtn','singleBtn','statsBtn'].forEach(id=>$(id).disabled=b);}
+
+/* subtle scan effect: thin progress line + one rotating log line */
+const SCAN_LOGS={
+  find:['[*] resolving target','[*] querying index','[*] cross-referencing','[+] fingerprinting matches'],
+  month:['[*] sweeping calendar','[*] masking by month','[+] collecting hits'],
+  list:['[*] tokenizing payload','[*] fuzzy matching','[!] resolving collisions','[+] correlating birthdays'],
+  all:['[*] opening database','[*] streaming rows'],
+  stats:['[*] profiling ages','[*] counting campuses','[*] computing upcoming','[+] building report']
+};
+function rhex(n){let s='';for(let i=0;i<n;i++)s+='0123456789abcdef'[Math.floor(Math.random()*16)];return s;}
+async function runScan(kind,work){
+  const lines=SCAN_LOGS[kind]||SCAN_LOGS.find,bar=$('prog');
+  bar.style.opacity=1;bar.style.width='8%';
+  let i=0,pct=8;STATUS.className='';
+  const tick=setInterval(()=>{
+    STATUS.textContent=lines[i%lines.length]+'  0x'+rhex(6);i++;
+    pct=Math.min(90,pct+(90-pct)*.2);bar.style.width=pct+'%';
+  },190);
+  const t0=Date.now();
+  try{
+    const r=await work();
+    const w=Math.max(0,650-(Date.now()-t0));if(w)await sleep(w);
+    return r;
+  }finally{
+    clearInterval(tick);bar.style.width='100%';
+    setTimeout(()=>{bar.style.opacity=0;setTimeout(()=>{bar.style.width='0';},320);},160);
+  }
 }
-function setBusy(b){['checkBtn','scanBtn','allBtn','singleBtn'].forEach(id=>$(id).disabled=b);}
 
 /* components */
 function meta(s){
-  const a=[s['Student ID'],s['Birthday']].filter(Boolean).join(' · ');
-  const b=[s['Campus'],s['Program']].filter(Boolean).join(' · ');
+  const a=[s['Student ID'],s['Birthday']].filter(Boolean).join('  /  ');
+  const b=[s['Campus'],s['Program']].filter(Boolean).join('  /  ');
   return [a,b];
-}
-function badge(month,day,hot){
-  if(!day&&!month)return null;
-  const b=el('div','badge'+(hot?' hot':''));
-  b.appendChild(document.createTextNode(day||'–'));
-  b.appendChild(el('small',null,month?MONTHS[month].slice(0,3):''));
-  return b;
 }
 function item(s,opts){
   opts=opts||{};
-  const it=el('div','item');
+  const it=el('div','item'+(opts.click?' click':''));
   const body=el('div','body');
-  body.appendChild(el('div','nm',s['Name']||opts.fallback||'—'));
+  body.appendChild(el('div','nm',s['Name']||opts.fallback||'--'));
   const m=meta(s);
   if(m[0])body.appendChild(el('div','mt',m[0]));
   if(m[1])body.appendChild(el('div','mt',m[1]));
-  if(opts.tag)body.appendChild(el('span','tag',opts.tag));
+  const pills=el('div');
+  if(s.DaysToBday===0)pills.appendChild(el('span','pill hot','birthday today'));
+  if(opts.tag)pills.appendChild(el('span','pill mute',opts.tag));
+  if(pills.childNodes.length)body.appendChild(pills);
   it.appendChild(body);
-  const b=badge(opts.month,opts.day,opts.hot);
-  if(b)it.appendChild(b);
+  const side=el('div','side');
+  if(s.Age!==''&&s.Age!=null){const a=el('div','age',s.Age);a.appendChild(el('small',null,'yrs'));side.appendChild(a);}
+  const mo=opts.month?MONTHS[opts.month].slice(0,3):'';
+  const dt=[mo,opts.day].filter(Boolean).join(' ');
+  if(dt)side.appendChild(el('div','dt',dt));
+  if(side.childNodes.length)it.appendChild(side);
+  if(opts.click)it.onclick=opts.click;
   return it;
 }
 function listOf(rows,fn,cap){
   const box=el('div','list');
-  if(!rows.length){box.appendChild(el('div','empty','Nothing here.'));return box;}
+  if(!rows.length){box.appendChild(el('div','empty','nothing here'));return box;}
   (cap&&rows.length>cap?rows.slice(0,cap):rows).forEach(r=>box.appendChild(fn(r)));
-  if(cap&&rows.length>cap)box.appendChild(el('div','empty','Showing '+cap+' of '+rows.length+' — use CSV for all.'));
+  if(cap&&rows.length>cap)box.appendChild(el('div','empty','showing '+cap+' of '+rows.length+', refine your search to see the rest'));
   return box;
 }
 function sum(parts){
   const s=el('div','sum');
-  parts.forEach(p=>{const sp=el('span');sp.innerHTML=p;s.appendChild(sp);});
+  parts.filter(Boolean).forEach(p=>{const sp=el('span');sp.innerHTML=p;s.appendChild(sp);});
   return s;
 }
-function esc(x){return String(x==null?'':x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-function csvDownload(rows,name){
-  const csv=rows.map(r=>r.map(v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\n');
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
-  a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+function h3(t,n){const h=el('div','h3',t);if(n!==undefined&&n!==null)h.appendChild(el('em',null,n));return h;}
+function btn(label,fn){const b=el('button','btn ghost sm',label);b.onclick=fn;return b;}
+function nextTxt(s){
+  const d=s.DaysToBday;
+  if(d===''||d==null)return '--';
+  if(d===0)return 'today';
+  return 'in '+d+' day'+(d===1?'':'s');
 }
-function csvBtn(label,fn){const b=el('button','btn ghost more',label);b.onclick=fn;return b;}
+function bars(pairs,onClick,wide){
+  const box=el('div','bars'+(wide?' wide':''));
+  const max=Math.max(1,...pairs.map(p=>p[1]));
+  pairs.forEach(([k,v])=>{
+    const r=el('div','brow');
+    if(onClick){r.style.cursor='pointer';r.title='tap to list students';r.onclick=()=>onClick(k);}
+    r.appendChild(el('span','bk',k));
+    const t=el('span','bt'),f=el('i');f.style.width=(v?Math.max(3,v/max*100):0)+'%';t.appendChild(f);r.appendChild(t);
+    r.appendChild(el('span','bv',v));
+    box.appendChild(r);
+  });
+  return box;
+}
 
 /* renderers */
-function renderSingle(d){
+function renderDossier(s,back){
   OUT.innerHTML='';
-  const s=d.student;
-  OUT.appendChild(sum(['match <b>'+esc(d.matchType)+'</b>','score <b>'+esc(d.score)+'</b>','row <b>'+esc(s._row)+'</b>']));
+  const nm=el('div','dossier-name');nm.appendChild(el('small',null,'target acquired'));
+  nm.appendChild(document.createTextNode(s['Name']||'--'));OUT.appendChild(nm);
   const kv=el('div','kv');
-  [['Student ID',s['Student ID']],['Name',s['Name']],['Birthday',s['Birthday']],['Campus',s['Campus']],
-   ['Program',s['Program']],['Month',s['Month']],['Day',s['Day']]].forEach(([k,v])=>{
-    const r=el('div');r.appendChild(el('span',null,k));r.appendChild(el('span',null,v===''||v==null?'—':v));kv.appendChild(r);
+  [['Student ID',s['Student ID']],['Birthday',s['Birthday']],
+   ['Age',s.Age===''?'--':s.Age+' years old','accent'],['Zodiac',s.Zodiac],['Next bday',nextTxt(s),'accent'],
+   ['Campus',s['Campus']],['Program',s['Program']]].forEach(([k,v,c])=>{
+    const r=el('div');r.appendChild(el('span',null,k));r.appendChild(el('span',c||null,v===''||v==null?'--':v));kv.appendChild(r);
   });
   OUT.appendChild(kv);
-  OUT.appendChild(csvBtn('Copy details',()=>navigator.clipboard&&navigator.clipboard.writeText(JSON.stringify(s,null,2))));
+  if(back)OUT.appendChild(btn('< back to candidates',()=>renderCandidates(back)));
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+function renderCandidates(j){
+  OUT.innerHTML='';
+  OUT.appendChild(sum(['<b>'+j.count+'</b> candidates for <b>'+esc(j.query)+'</b>',
+    j.count>j.candidates.length?'showing <b>'+j.candidates.length+'</b>':'']));
+  const box=el('div','list');
+  j.candidates.forEach(s=>box.appendChild(item(s,{
+    month:MONTHS.indexOf(s.Month),day:s.Day,
+    tag:s.score<1?'match '+Math.round(s.score*100)+'%':null,
+    click:()=>renderDossier(s,j)})));
+  OUT.appendChild(box);
+  OUT.appendChild(el('div','hint','tap a name to open'));
 }
 function renderMonth(d){
   OUT.innerHTML='';
-  OUT.appendChild(sum(['<b>'+d.count+'</b> in <b>'+esc(d.monthName)+'</b>']));
+  OUT.appendChild(sum(['<b>'+d.count+'</b> birthdays in <b>'+esc(d.monthName.toLowerCase())+'</b>']));
   const mi=MONTHS.indexOf(d.monthName);
-  OUT.appendChild(listOf(d.rows,r=>item(r,{month:mi,day:r.day,hot:true}),RENDER_CAP));
+  OUT.appendChild(listOf(d.rows,r=>item(r,{month:mi,day:r.day,tag:r.DaysToBday===''||r.DaysToBday===0?null:nextTxt(r)}),RENDER_CAP));
 }
 function renderAll(d){
-  LAST_ALL=d;OUT.innerHTML='';
+  OUT.innerHTML='';
   OUT.appendChild(sum(['<b>'+d.count+'</b> students']));
-  const f=el('input');f.placeholder='Filter name, ID, campus, month…';f.setAttribute('autocapitalize','off');
+  const f=el('input');f.placeholder='filter by name, id, campus, month, age';f.setAttribute('autocapitalize','off');
   OUT.appendChild(f);
-  const holder=el('div');holder.style.marginTop='12px';OUT.appendChild(holder);
-  const cols=['Student ID','Name','Birthday','Campus','Program','Month','Day'];
+  const holder=el('div');holder.style.marginTop='10px';OUT.appendChild(holder);
+  const cols=['Student ID','Name','Birthday','Age','Campus','Program','Month','Day'];
   const draw=q=>{
     q=(q||'').trim().toLowerCase();
     const rows=q?d.rows.filter(r=>cols.some(c=>String(r[c]).toLowerCase().includes(q))):d.rows;
@@ -771,43 +1000,56 @@ function renderAll(d){
     holder.appendChild(listOf(rows,r=>item(r,{month:MONTHS.indexOf(r.Month),day:r.Day}),RENDER_CAP));
   };
   f.oninput=()=>draw(f.value);draw('');
-  OUT.appendChild(csvBtn('Download CSV',()=>{
-    const rows=[cols];d.rows.forEach(r=>rows.push(cols.map(c=>r[c])));csvDownload(rows,'students-all.csv');
-  }));
 }
 function renderList(a){
   OUT.innerHTML='';
-  const p=['<b>'+a.total+'</b> lines','<b>'+a.matchedCount+'</b> matched','<b>'+a.thisMonthCount+'</b> in <b>'+esc(a.monthName||'—')+'</b>'];
+  const p=['<b>'+a.total+'</b> lines','<b>'+a.matchedCount+'</b> matched','<b>'+a.thisMonthCount+'</b> in <b>'+esc((a.monthName||'--').toLowerCase())+'</b>'];
   if(a.duplicates&&a.duplicates.length)p.push('<b>'+a.duplicates.length+'</b> duplicates skipped');
   if(a.unmatchedCount)p.push('<b>'+a.unmatchedCount+'</b> unmatched');
   OUT.appendChild(sum(p));
-  if(a.lastError)OUT.appendChild(el('div','err','Server error: '+a.lastError));
+  if(a.lastError)OUT.appendChild(el('div','err','server error: '+a.lastError));
   if(!a.matchedCount&&!a.unmatchedCount)return;
 
-  const mk=(e,hot)=>item(e.student||{},{fallback:e.line,month:e.birthdayMonth,day:e.birthdayDay,hot:hot,
-    tag:e.matchType==='inline'?'date from line':(e.matched&&e.matchType!=='id'&&e.matchType!=='exact'?e.matchType+' · '+e.score:null)});
+  const mk=e=>item(e.student||{},{fallback:e.line,month:e.birthdayMonth,day:e.birthdayDay,
+    tag:e.matchType==='inline'?'date from line':(e.matched&&e.matchType!=='id'&&e.matchType!=='exact'?e.matchType+' '+e.score:null)});
 
-  OUT.appendChild(el('div','h3','Birthday in '+(a.monthName||'—')+' · '+a.thisMonth.length));
-  OUT.appendChild(listOf(a.thisMonth,e=>mk(e,true),RENDER_CAP));
+  OUT.appendChild(h3('birthday in '+(a.monthName||'--').toLowerCase(),a.thisMonth.length));
+  OUT.appendChild(listOf(a.thisMonth,mk,RENDER_CAP));
   if(a.matchedOther.length){
-    OUT.appendChild(el('div','h3','Other months · '+a.matchedOther.length));
-    OUT.appendChild(listOf(a.matchedOther,e=>mk(e,false),RENDER_CAP));
+    OUT.appendChild(h3('other months',a.matchedOther.length));
+    OUT.appendChild(listOf(a.matchedOther,mk,RENDER_CAP));
   }
   if(a.unmatched.length){
-    OUT.appendChild(el('div','h3','Unmatched · '+a.unmatched.length));
+    OUT.appendChild(h3('unmatched',a.unmatched.length));
     OUT.appendChild(listOf(a.unmatched,u=>{
       const it=el('div','item'),b=el('div','body');
       b.appendChild(el('div','nm',u.line));b.appendChild(el('div','mt',u.error||'no match'));
       it.appendChild(b);return it;
     },RENDER_CAP));
   }
-  OUT.appendChild(csvBtn('Download CSV',()=>{
-    const rows=[['Group','Student ID','Name','Birthday','Campus','Program','Match','Score']];
-    const push=(g,e)=>{const s=e.student||{};rows.push([g,s['Student ID']||'',s['Name']||e.line||'',s['Birthday']||'',s['Campus']||'',s['Program']||'',e.matchType||'',e.score||'']);};
-    a.thisMonth.forEach(e=>push('thisMonth',e));a.matchedOther.forEach(e=>push('other',e));
-    a.unmatched.forEach(e=>rows.push(['unmatched','',e.line||'','','','','','']));
-    csvDownload(rows,'birthdays-'+(a.monthName||'month')+'.csv');
-  }));
+}
+function renderStats(d){
+  OUT.innerHTML='';
+  const grid=el('div','cards');
+  [['students',d.total],['dated',d.withBirthday],['avg age',d.avgAge==null?'--':d.avgAge],['today',d.today.length]].forEach(([k,v])=>{
+    const c=el('div','card');c.appendChild(el('b',null,v));c.appendChild(el('small',null,k));grid.appendChild(c);
+  });
+  OUT.appendChild(grid);
+  if(d.today.length){
+    OUT.appendChild(h3('birthday today',d.today.length));
+    OUT.appendChild(listOf(d.today,r=>item(r,{month:MONTHS.indexOf(r.Month),day:r.Day}),RENDER_CAP));
+  }
+  OUT.appendChild(h3('incoming, next '+d.days+' days',d.upcomingCount));
+  OUT.appendChild(listOf(d.upcoming,r=>item(r,{month:MONTHS.indexOf(r.Month),day:r.Day,tag:nextTxt(r)}),RENDER_CAP));
+  if(d.byCampus.length){
+    OUT.appendChild(h3('students per campus',d.byCampus.length+' campuses'));
+    OUT.appendChild(bars(d.byCampus,loadCampus,true));
+    OUT.appendChild(el('div','hint','tap a campus to list its students'+(d.noCampus?'  |  '+d.noCampus+' with no campus':'')));
+  }
+  OUT.appendChild(h3('by month'));
+  OUT.appendChild(bars(MONTHS.slice(1).map((m,i)=>[m.slice(0,3).toLowerCase(),d.byMonth[i+1]||0])));
+  if(d.byProgram.length){OUT.appendChild(h3('by program'));OUT.appendChild(bars(d.byProgram,null,true));}
+  if(d.byAge.length){OUT.appendChild(h3('by age'));OUT.appendChild(bars(d.byAge.map(a=>['age '+a[0],a[1]])));}
 }
 
 /* network */
@@ -816,81 +1058,102 @@ async function withTimeout(url,opts,ms){
   try{return await fetch(url,{...opts,signal:c.signal});}finally{clearTimeout(t);}
 }
 async function readErr(r){try{return (await r.json()).error||('HTTP '+r.status);}catch(_){return 'HTTP '+r.status;}}
-const fail=e=>setStatus(e.name==='AbortError'?'Timed out.':'Request failed: '+e.message,'bad');
+const fail=e=>setStatus(e.name==='AbortError'?'[!] connection timed out':'[!] request failed: '+e.message,'bad');
 
 async function lookupSingle(){
   const q=SINGLE.value.trim();
-  if(!q){setStatus('Enter a name or student ID.','bad');return;}
-  SINGLE.blur();setBusy(true);setStatus('Searching…','load');
+  if(!q){setStatus('[!] enter a name or student ID','bad');return;}
+  SINGLE.blur();setBusy(true);
   try{
-    const r=await withTimeout('/student?q='+encodeURIComponent(q),{},15000);
-    if(r.status===404){OUT.innerHTML='';setStatus('No match for “'+q+'”.','bad');return;}
-    if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
+    const r=await runScan('find',()=>withTimeout('/search?q='+encodeURIComponent(q),{},15000));
+    if(r.status===404){OUT.innerHTML='';setStatus('[-] no match for "'+q+'"','bad');return;}
+    if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
     const j=await r.json();
-    setStatus(j.elapsedMs+' ms','ok');renderSingle(j);
+    setStatus('[+] '+j.count+' found in '+j.elapsedMs+' ms','ok');
+    if(j.candidates.length===1)renderDossier(j.candidates[0],null);else renderCandidates(j);
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
 async function scanWorkbook(){
-  setBusy(true);setStatus('Loading…','load');
+  setBusy(true);
   try{
-    const r=await withTimeout('/birthdays?month='+monthSel(),{},15000);
-    if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
-    const j=await r.json();setStatus(j.elapsedMs+' ms','ok');renderMonth(j);
+    const r=await runScan('month',()=>withTimeout('/birthdays?month='+monthSel(),{},15000));
+    if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
+    const j=await r.json();setStatus('[+] done in '+j.elapsedMs+' ms','ok');renderMonth(j);
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
 async function scanAll(){
-  setBusy(true);setStatus('Loading everyone…','load');
+  setBusy(true);
   try{
-    const r=await withTimeout('/all',{},30000);
-    if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
-    const j=await r.json();setStatus(j.elapsedMs+' ms','ok');renderAll(j);
+    const r=await runScan('all',()=>withTimeout('/all',{},30000));
+    if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
+    const j=await r.json();setStatus('[+] done in '+j.elapsedMs+' ms','ok');renderAll(j);
   }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
-async function checkList(){
-  const raw=PASTE.value,file=$('file').files[0];
-  if(!raw.trim()&&!file){setStatus('Paste names or attach a txt file.','bad');return;}
-  const month=monthSel(),t0=performance.now();
+async function loadStats(){
   setBusy(true);
-
-  if(file){
-    setStatus('Uploading…','load');
-    try{
-      const fd=new FormData();fd.append('file',file);fd.append('month',String(month));
-      const r=await withTimeout('/birthdays/list',{method:'POST',body:fd},120000);
-      if(!r.ok){setStatus('Error: '+(await readErr(r)),'bad');return;}
-      const j=await r.json();
-      setStatus(Math.round(performance.now()-t0)+' ms','ok');renderList(j);
-    }catch(e){fail(e);}finally{setBusy(false);checkServer();}
-    return;
-  }
-
+  try{
+    const r=await runScan('stats',()=>withTimeout('/stats?days='+$('days').value,{},20000));
+    if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
+    const j=await r.json();STATS_LOADED=true;
+    setStatus('[+] recon done in '+j.elapsedMs+' ms','ok');renderStats(j);
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
+}
+async function loadCampus(name){
+  setBusy(true);
+  try{
+    const r=await runScan('all',()=>withTimeout('/all?campus='+encodeURIComponent(name),{},30000));
+    if(!r.ok){setStatus('[!] '+(await readErr(r)),'bad');return;}
+    const j=await r.json();
+    setStatus('[+] '+j.count+' students in '+name,'ok');renderAll(j);
+    OUT.insertBefore(btn('< back to intel',()=>loadStats()),OUT.firstChild);
+    window.scrollTo({top:0,behavior:'smooth'});
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
+}
+async function batchCheck(raw,month){
   const lines=raw.split('\n').map(s=>s.trim()).filter(Boolean);
   const batches=[];for(let i=0;i<lines.length;i+=BATCH_SIZE)batches.push(lines.slice(i,i+BATCH_SIZE));
   const agg={monthName:null,total:0,duplicates:[],thisMonth:[],matchedOther:[],unmatched:[],failed:0,lastError:null};
+  for(let b=0;b<batches.length;b++){
+    try{
+      const r=await withTimeout('/birthdays/list',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({text:batches[b].join('\n'),month})},60000);
+      if(!r.ok){agg.failed++;if(!agg.lastError)agg.lastError=await readErr(r);continue;}
+      let j;try{j=await r.json();}catch(_){agg.failed++;if(!agg.lastError)agg.lastError='bad JSON';continue;}
+      agg.monthName=j.monthName;agg.total+=j.total||0;
+      agg.duplicates.push(...(j.duplicates||[]));agg.thisMonth.push(...(j.thisMonth||[]));
+      agg.matchedOther.push(...(j.matchedOther||[]));agg.unmatched.push(...(j.unmatched||[]));
+    }catch(e){agg.failed++;if(!agg.lastError)agg.lastError=String(e.message||e);}
+  }
+  agg.thisMonth.sort((a,b)=>((a.birthdayDay||99)-(b.birthdayDay||99))||String((a.student||{}).Name||'').localeCompare(String((b.student||{}).Name||'')));
+  agg.matchedOther.sort((a,b)=>((a.birthdayMonth||99)-(b.birthdayMonth||99))||((a.birthdayDay||99)-(b.birthdayDay||99)));
+  agg.matchedCount=agg.thisMonth.length+agg.matchedOther.length;
+  agg.thisMonthCount=agg.thisMonth.length;agg.unmatchedCount=agg.unmatched.length;
+  return agg;
+}
+async function checkList(){
+  const raw=PASTE.value,file=$('file').files[0];
+  if(!raw.trim()&&!file){setStatus('[!] paste names or attach a txt file','bad');return;}
+  const month=monthSel(),t0=performance.now();
+  setBusy(true);
   try{
-    for(let b=0;b<batches.length;b++){
-      setStatus('Batch '+(b+1)+' of '+batches.length+'…','load');
-      try{
-        const r=await withTimeout('/birthdays/list',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({text:batches[b].join('\n'),month})},60000);
-        if(!r.ok){agg.failed++;if(!agg.lastError)agg.lastError=await readErr(r);continue;}
-        let j;try{j=await r.json();}catch(_){agg.failed++;if(!agg.lastError)agg.lastError='bad JSON';continue;}
-        agg.monthName=j.monthName;agg.total+=j.total||0;
-        agg.duplicates.push(...(j.duplicates||[]));agg.thisMonth.push(...(j.thisMonth||[]));
-        agg.matchedOther.push(...(j.matchedOther||[]));agg.unmatched.push(...(j.unmatched||[]));
-      }catch(e){agg.failed++;if(!agg.lastError)agg.lastError=String(e.message||e);}
+    let agg;
+    if(file){
+      agg=await runScan('list',async()=>{
+        const fd=new FormData();fd.append('file',file);fd.append('month',String(month));
+        const r=await withTimeout('/birthdays/list',{method:'POST',body:fd},120000);
+        if(!r.ok)throw new Error(await readErr(r));
+        return await r.json();
+      });
+    }else{
+      agg=await runScan('list',()=>batchCheck(raw,month));
     }
-    agg.thisMonth.sort((a,b)=>((a.birthdayDay||99)-(b.birthdayDay||99))||String((a.student||{}).Name||'').localeCompare(String((b.student||{}).Name||'')));
-    agg.matchedOther.sort((a,b)=>((a.birthdayMonth||99)-(b.birthdayMonth||99))||((a.birthdayDay||99)-(b.birthdayDay||99)));
-    agg.matchedCount=agg.thisMonth.length+agg.matchedOther.length;
-    agg.thisMonthCount=agg.thisMonth.length;agg.unmatchedCount=agg.unmatched.length;
-    setStatus(Math.round(performance.now()-t0)+' ms'+(agg.failed?' · '+agg.failed+' batch(es) failed':''),agg.failed?'bad':'ok');
+    setStatus('[+] done in '+Math.round(performance.now()-t0)+' ms'+(agg.failed?'  |  '+agg.failed+' batch(es) failed':''),agg.failed?'bad':'ok');
     renderList(agg);
-  }finally{setBusy(false);checkServer();}
+  }catch(e){fail(e);}finally{setBusy(false);checkServer();}
 }
 function clearAll(){
   PASTE.value='';safe(()=>localStorage.removeItem(LS_PASTE));
-  $('file').value='';$('fileLbl').textContent='＋ Attach .txt file';
+  $('file').value='';$('fileLbl').textContent='attach .txt';
   SINGLE.value='';OUT.innerHTML='';setStatus('');
 }
 
@@ -899,6 +1162,8 @@ $('scanBtn').onclick=scanWorkbook;
 $('allBtn').onclick=scanAll;
 $('checkBtn').onclick=checkList;
 $('clearBtn').onclick=clearAll;
+$('statsBtn').onclick=loadStats;
+$('days').onchange=()=>{if(STATS_LOADED)loadStats();};
 SINGLE.addEventListener('keydown',e=>{if(e.key==='Enter')lookupSingle();});
 </script>
 </body>
@@ -921,6 +1186,8 @@ def debug_status():
         "visible_columns": VISIBLE,
         "cwd": os.getcwd(),
         "script_dir": os.path.dirname(os.path.abspath(__file__)),
+        "today": _today().isoformat(),
+        "tz_offset_hours": TZ_OFFSET_HOURS,
     }
     if out["exists"]:
         try:
@@ -962,6 +1229,41 @@ def debug_status():
     return jsonify(out), 200
 
 
+@app.get("/search")
+def search():
+    """Candidate search. 'james' -> every student with James in their name.
+    An exact student ID returns just that one student."""
+    t0 = time.time()
+    try:
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return jsonify({"error": "q required"}), 400
+        idx = get_index()
+        m = match_index(idx, q)
+        mode = "name"
+        if m is not None and m["matchType"] in ("id", "id-token"):
+            found, total, mode = [(1.0, m["index"])], 1, "id"
+        else:
+            found, total = find_candidates(idx, q)
+            if not found and m is not None:
+                found, total = [(m["score"], m["index"])], 1
+        if not found:
+            return jsonify({"found": False, "query": q, "count": 0, "candidates": [],
+                            "elapsedMs": int((time.time() - t0) * 1000)}), 404
+        cands = []
+        for sc, i in found:
+            s = full_student(idx, i)
+            s["score"] = round(sc, 3)
+            cands.append(s)
+        return jsonify({
+            "found": True, "query": q, "mode": mode,
+            "count": total, "candidates": cands,
+            "elapsedMs": int((time.time() - t0) * 1000),
+        }), 200
+    except Exception as e:
+        return _err("/search", e, t0)
+
+
 @app.get("/student")
 def student_single():
     t0 = time.time()
@@ -993,11 +1295,12 @@ def birthdays():
         if m_num is None:
             return jsonify({"error": "month must be 1-12 or month name"}), 400
         idx = get_index()
+        today = _today()
         out = []
         for row in idx["rows"]:
             if row["birthday_month"] != m_num:
                 continue
-            item = row_to_public(row)
+            item = row_to_public(row, today)
             item["_row"] = row["row"]
             item["day"] = row["birthday_day"]
             out.append(item)
@@ -1013,9 +1316,10 @@ def all_rows():
     t0 = time.time()
     try:
         idx = get_index()
+        today = _today()
         out = []
         for row in idx["rows"]:
-            item = row_to_public(row)
+            item = row_to_public(row, today)
             item["Month"] = _MONTH_NAMES[row["birthday_month"]] if row["birthday_month"] else ""
             item["Day"] = row["birthday_day"] if row["birthday_day"] is not None else ""
             item["_row"] = row["row"]
@@ -1023,8 +1327,12 @@ def all_rows():
 
         q = (request.args.get("q") or "").strip().lower()
         if q:
-            fields = VISIBLE + ["Month"]
+            fields = VISIBLE + ["Month", "Age"]
             out = [r for r in out if any(q in str(r.get(f, "")).lower() for f in fields)]
+
+        c_raw = (request.args.get("campus") or "").strip().lower()
+        if c_raw:
+            out = [r for r in out if r["Campus"].strip().lower() == c_raw]
 
         m_raw = request.args.get("month")
         if m_raw:
@@ -1037,6 +1345,68 @@ def all_rows():
                         "rows": out, "elapsedMs": int((time.time() - t0) * 1000)}), 200
     except Exception as e:
         return _err("/all", e, t0)
+
+
+@app.get("/stats")
+def stats():
+    """Database recon: totals, average age, today's birthdays, incoming birthdays, distributions."""
+    t0 = time.time()
+    try:
+        try:
+            days = max(1, min(365, int(request.args.get("days", "30"))))
+        except ValueError:
+            days = 30
+        idx = get_index()
+        today = _today()
+        by_month = [0] * 13
+        campus, program, ages_c = Counter(), Counter(), Counter()
+        ages = []
+        today_list, upcoming = [], []
+        with_bday = 0
+
+        for row in idx["rows"]:
+            m = row["birthday_month"]
+            if m:
+                by_month[m] += 1
+                with_bday += 1
+            if row["campus"].strip():
+                campus[row["campus"].strip()] += 1
+            if row["program"].strip():
+                program[row["program"].strip()] += 1
+
+            pub = row_to_public(row, today)
+            if pub["Age"] != "":
+                ages.append(pub["Age"])
+                ages_c[pub["Age"]] += 1
+            dd = pub["DaysToBday"]
+            if dd != "" and dd <= days:
+                pub["Month"] = _MONTH_NAMES[m] if m else ""
+                pub["Day"] = row["birthday_day"]
+                (today_list if dd == 0 else upcoming).append(pub)
+
+        upcoming.sort(key=lambda x: (x["DaysToBday"], x["Name"]))
+        today_list.sort(key=lambda x: x["Name"])
+
+        return jsonify({
+            "total": len(idx["rows"]),
+            "withBirthday": with_bday,
+            "avgAge": round(sum(ages) / len(ages), 1) if ages else None,
+            "minAge": min(ages) if ages else None,
+            "maxAge": max(ages) if ages else None,
+            "today": today_list,
+            "days": days,
+            "upcomingCount": len(upcoming),
+            "upcoming": upcoming[:100],
+            "byMonth": by_month,
+            "byCampus": campus.most_common(),
+            "noCampus": sum(1 for r in idx["rows"] if not r["campus"].strip()),
+            "byProgram": program.most_common(8),
+            "byAge": sorted(ages_c.items()),
+            "asOf": today.isoformat(),
+            "elapsedMs": int((time.time() - t0) * 1000),
+        }), 200
+    except Exception as e:
+        return _err("/stats", e, t0)
 
 
 @app.post("/birthdays/list")
@@ -1073,6 +1443,7 @@ def birthdays_list():
             lines.append(ln)
 
         idx = get_index()
+        today = _today()
         this_month, matched_other, unmatched = [], [], []
 
         for line in lines:
@@ -1106,11 +1477,15 @@ def birthdays_list():
                     entry["birthdayDay"] = None
                     entry["thisMonth"] = False
             elif inline_bd is not None:
+                dv = _derived(inline_bd.month, inline_bd.day,
+                              inline_bd.year if inline_bd.year != 1900 else None, today)
                 entry.update({
                     "matched": False, "rowNumber": None, "score": None, "matchType": "inline",
                     "student": {"Student ID": "", "Name": name_part or line,
                                 "Birthday": inline_bd.strftime("%B %d, %Y"),
-                                "Campus": "", "Program": ""},
+                                "Campus": "", "Program": "",
+                                "Age": dv["Age"], "Zodiac": dv["Zodiac"],
+                                "DaysToBday": dv["DaysToBday"]},
                     "birthdayMonth": inline_bd.month,
                     "birthdayMonthName": _MONTH_NAMES[inline_bd.month],
                     "birthdayDay": inline_bd.day,
